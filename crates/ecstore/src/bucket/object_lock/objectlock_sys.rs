@@ -54,11 +54,52 @@ pub fn enforce_retention_for_deletion(obj_info: &ObjectInfo) -> bool {
     match ret.mode {
         Some(r) if (r.as_str() == ObjectLockRetentionMode::COMPLIANCE || r.as_str() == ObjectLockRetentionMode::GOVERNANCE) => {
             let t = objectlock::utc_now_ntp();
-            if OffsetDateTime::from(ret.retain_until_date.expect("err!")).unix_timestamp() > t.unix_timestamp() {
-                return true;
+            if let Some(retain_until_date) = ret.retain_until_date {
+                if OffsetDateTime::from(retain_until_date).unix_timestamp() > t.unix_timestamp() {
+                    return true;
+                }
             }
         }
         _ => (),
     }
+    false
+}
+
+/// Check if object deletion should be blocked due to Object Lock retention (including default retention)
+pub async fn check_object_lock_for_deletion(bucket: &str, obj_info: &ObjectInfo) -> bool {
+    // First check explicit retention on the object
+    if enforce_retention_for_deletion(obj_info) {
+        return true;
+    }
+
+    // If no explicit retention, check default retention from bucket configuration
+    if let Some(default_retention) = BucketObjectLockSys::get(bucket).await {
+        // Only apply default retention if object has no explicit retention
+        let explicit_ret = objectlock::get_object_retention_meta(obj_info.user_defined.clone());
+        if explicit_ret.mode.is_none() {
+            // Check if default retention mode is set
+            if let Some(mode) = &default_retention.mode {
+                let mode_str = mode.as_str();
+                if mode_str == ObjectLockRetentionMode::COMPLIANCE || mode_str == ObjectLockRetentionMode::GOVERNANCE {
+                    // Calculate retention expiration date from object modification time
+                    if let Some(mod_time) = obj_info.mod_time {
+                        let now = objectlock::utc_now_ntp();
+                        let retain_until = if let Some(days) = default_retention.days {
+                            mod_time.saturating_add(time::Duration::days(days as i64))
+                        } else if let Some(years) = default_retention.years {
+                            mod_time.saturating_add(time::Duration::days(years as i64 * 365))
+                        } else {
+                            return false; // No retention period specified
+                        };
+
+                        if retain_until.unix_timestamp() > now.unix_timestamp() {
+                            return true; // Object is still under retention
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     false
 }

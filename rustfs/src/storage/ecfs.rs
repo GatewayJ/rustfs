@@ -54,7 +54,7 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         metadata_sys::get_replication_config,
-        object_lock::objectlock_sys::BucketObjectLockSys,
+        object_lock::objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion},
         policy_sys::PolicySys,
         quota::QuotaOperation,
         replication::{
@@ -1697,11 +1697,12 @@ impl S3 for FS {
 
         let metadata = extract_metadata(&req.headers);
 
+        // Clone version_id before it's moved
+        let version_id_clone = version_id.clone();
+
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
-
-        // TODO: check object lock
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
         if lock_cfg.is_some() && opts.delete_prefix {
@@ -1724,6 +1725,30 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        // Check Object Lock retention before deletion
+        // Get object info first to check retention
+        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
+            .await
+            .map_err(ApiError::from)?;
+
+        match store.get_object_info(&bucket, &key, &get_opts).await {
+            Ok(obj_info) => {
+                use rustfs_ecstore::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
+                if check_object_lock_for_deletion(&bucket, &obj_info).await {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::AccessDenied,
+                        "Object is retained and cannot be deleted until the retention period expires",
+                    ));
+                }
+            }
+            Err(err) => {
+                // If object not found, allow deletion to proceed (will return 204 No Content)
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(ApiError::from(err).into());
+                }
+            }
+        }
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts).await {
@@ -1917,6 +1942,17 @@ impl S3 for FS {
                 Ok(res) => (res, None),
                 Err(e) => (ObjectInfo::default(), Some(e.to_string())),
             };
+
+            // Check Object Lock retention before deletion
+            if gerr.is_none() && check_object_lock_for_deletion(&bucket, &goi).await {
+                delete_results[idx].error = Some(Error {
+                    code: Some("AccessDenied".to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some("Object is retained and cannot be deleted until the retention period expires".to_string()),
+                    version_id: version_id.clone(),
+                });
+                continue;
+            }
 
             // Store object size for quota tracking
             object_sizes.insert(object.object_name.clone(), goi.size);
@@ -5629,6 +5665,20 @@ impl S3 for FS {
         metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        // When Object Lock is enabled, automatically enable versioning if not already enabled
+        // This matches AWS S3 and MinIO behavior
+        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
+        if !versioning_config.enabled() {
+            let enable_versioning_config = VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            };
+            let versioning_data = try_!(serialize(&enable_versioning_config));
+            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
+                .await
+                .map_err(ApiError::from)?;
+        }
 
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
