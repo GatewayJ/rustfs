@@ -81,7 +81,7 @@ use rustfs_ecstore::{
             DeletedObjectReplicationInfo, check_replicate_delete, get_must_replicate_options, must_replicate,
             schedule_replication, schedule_replication_delete,
         },
-        tagging::{decode_tags, encode_tags},
+        tagging::{decode_tags, decode_tags_to_map, encode_tags},
         utils::serialize,
         versioning::VersioningApi,
         versioning_sys::BucketVersioningSys,
@@ -192,6 +192,31 @@ impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
         Self {}
+    }
+
+    /// Returns object tags as policy condition values (keys like `ExistingObjectTag/<tag-key>`).
+    /// Used so bucket policy conditions such as s3:ExistingObjectTag/public-read can be evaluated.
+    pub async fn get_object_tag_conditions_for_policy(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut out = std::collections::HashMap::new();
+        let Some(store) = new_object_layer_fn() else {
+            return out;
+        };
+        let mut opts = ObjectOptions::default();
+        opts.version_id = version_id.map(String::from);
+        let tags = match store.get_object_tags(bucket, object, &opts).await {
+            Ok(t) => t,
+            Err(_) => return out,
+        };
+        let map = decode_tags_to_map(&tags);
+        for (k, v) in map {
+            out.insert(format!("ExistingObjectTag/{}", k), vec![v]);
+        }
+        out
     }
 
     #[instrument(level = "debug", skip(self, req))]
