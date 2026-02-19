@@ -36,9 +36,15 @@ pub(crate) struct ReqInfo {
     pub region: Option<String>,
 }
 
+/// Object tags as condition values for bucket policy (e.g. s3:ExistingObjectTag/key).
+/// Set by GetObject/HeadObject before authorization so tag-based policy conditions can be evaluated.
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectTagConditions(pub HashMap<String, Vec<String>>);
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    let object_tag_conditions = req.extensions.get::<ObjectTagConditions>().cloned();
 
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
@@ -52,7 +58,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None, remote_addr);
+        let mut conditions = get_condition_values(&req.headers, cred, req_info.version_id.as_deref(), None, remote_addr);
+        if let Some(ref tags) = object_tag_conditions {
+            for (k, v) in &tags.0 {
+                conditions.insert(k.clone(), v.clone());
+            }
+        }
 
         if action == Action::S3Action(S3Action::DeleteObjectAction)
             && req_info.version_id.is_some()
@@ -147,13 +158,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             }
         }
     } else {
-        let conditions = get_condition_values(
+        let mut conditions = get_condition_values(
             &req.headers,
             &rustfs_credentials::Credentials::default(),
             req_info.version_id.as_deref(),
             req.region.as_deref(),
             remote_addr,
         );
+        if let Some(ref tags) = object_tag_conditions {
+            for (k, v) in &tags.0 {
+                conditions.insert(k.clone(), v.clone());
+            }
+        }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
             if PolicySys::is_allowed(&BucketPolicyArgs {
@@ -706,6 +722,15 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
+        let tag_conditions = self
+            .get_object_tag_conditions_for_policy(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await;
+        req.extensions.insert(ObjectTagConditions(tag_conditions));
+
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
 
@@ -729,6 +754,15 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
+
+        let tag_conditions = self
+            .get_object_tag_conditions_for_policy(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await;
+        req.extensions.insert(ObjectTagConditions(tag_conditions));
 
         if req.input.version_id.is_some() {
             authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAttributesAction)).await?;
@@ -819,6 +853,15 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
+
+        let tag_conditions = self
+            .get_object_tag_conditions_for_policy(
+                &req.input.bucket,
+                &req.input.key,
+                req.input.version_id.as_deref(),
+            )
+            .await;
+        req.extensions.insert(ObjectTagConditions(tag_conditions));
 
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
