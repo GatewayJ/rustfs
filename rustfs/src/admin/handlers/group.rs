@@ -26,7 +26,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
+use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user, Error as IamError};
 use rustfs_madmin::GroupAddRemove;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{
@@ -61,6 +61,12 @@ pub fn register_group_management_route(r: &mut S3Router<AdminOperation>) -> std:
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-group-members").as_str(),
         AdminOperation(&UpdateGroupMembers {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/group/{{name}}").as_str(),
+        AdminOperation(&DeleteGroup {}),
     )?;
 
     Ok(())
@@ -219,6 +225,54 @@ impl Operation for SetGroupStatus {
         } else {
             return Err(s3_error!(InvalidArgument, "status is required"));
         }
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+pub struct DeleteGroup {}
+#[async_trait::async_trait]
+impl Operation for DeleteGroup {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle DeleteGroup");
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let name = params.get("name").map(|s| s.to_string()).unwrap_or_default();
+        if name.is_empty() {
+            return Err(s3_error!(InvalidArgument, "group name is required"));
+        }
+
+        let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        iam_store.remove_users_from_group(&name, vec![]).await.map_err(|e| {
+            warn!("delete group failed, e: {:?}", e);
+            match e {
+                IamError::NoSuchGroup(_) => S3Error::with_message(S3ErrorCode::InvalidArgument, "group does not exist"),
+                IamError::GroupNotEmpty => {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "group is not empty, remove all members first")
+                }
+                _ => S3Error::with_message(S3ErrorCode::InternalError, e.to_string()),
+            }
+        })?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
