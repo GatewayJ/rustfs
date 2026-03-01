@@ -460,7 +460,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
-            if PolicySys::is_allowed(&BucketPolicyArgs {
+            let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: req_info.bucket.as_deref().unwrap_or(""),
                 action,
                 is_owner: false,
@@ -469,8 +469,21 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 conditions: &conditions,
                 object: req_info.object.as_deref().unwrap_or(""),
             })
-            .await
-            {
+            .await;
+
+            if policy_allowed {
+                // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
+                // Fail closed: if we cannot read the config, do not allow public access.
+                match metadata_sys::get_public_access_block_config(bucket_name).await {
+                    Ok((config, _)) => {
+                        if config.restrict_public_buckets.unwrap_or(false) {
+                            return Err(s3_error!(AccessDenied, "Access Denied"));
+                        }
+                    }
+                    Err(_) => {
+                        return Err(s3_error!(AccessDenied, "Access Denied"));
+                    }
+                }
                 return Ok(());
             }
 
