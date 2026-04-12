@@ -47,6 +47,10 @@ const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
 
+fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
+    !policies.is_empty() || !groups.is_empty()
+}
+
 pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(Method::POST, "/", AdminOperation(&AssumeRoleHandle {}))?;
 
@@ -241,7 +245,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     // Map claims to policies and groups
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
 
-    if policies.is_empty() && groups.is_empty() {
+    if !has_identity_authorization_context(&policies, &groups) {
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
@@ -483,5 +487,16 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[test]
+    fn test_has_identity_authorization_context() {
+        let empty: Vec<String> = vec![];
+        let groups = vec!["RustFS.ConsoleAdmin".to_string()];
+        let policies = vec!["consoleAdmin".to_string()];
+
+        assert!(!has_identity_authorization_context(&empty, &empty));
+        assert!(has_identity_authorization_context(&policies, &empty));
+        assert!(has_identity_authorization_context(&empty, &groups));
     }
 }
