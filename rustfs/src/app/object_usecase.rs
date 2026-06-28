@@ -166,7 +166,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
@@ -250,8 +250,8 @@ struct GetObjectBootstrap {
     concurrent_requests: usize,
 }
 
-struct GetObjectIoPlanning<'a> {
-    _disk_permit: tokio::sync::SemaphorePermit<'a>,
+struct GetObjectIoPlanning {
+    disk_permit: OwnedSemaphorePermit,
     permit_wait_duration: Duration,
     queue_status: concurrency::IoQueueStatus,
     queue_utilization: f64,
@@ -282,8 +282,8 @@ struct GetObjectReadSetup {
     encryption_applied: bool,
 }
 
-struct GetObjectPreparedRead<'a> {
-    io_planning: GetObjectIoPlanning<'a>,
+struct GetObjectPreparedRead {
+    io_planning: GetObjectIoPlanning,
     read_setup: GetObjectReadSetup,
 }
 
@@ -407,6 +407,32 @@ pin_project! {
         bytes: Bytes,
         emitted: bool,
         _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    }
+}
+
+pin_project! {
+    struct DiskReadPermitReader<R> {
+        #[pin]
+        inner: R,
+        _disk_permit: OwnedSemaphorePermit,
+    }
+}
+
+impl<R> DiskReadPermitReader<R> {
+    fn new(inner: R, disk_permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            _disk_permit: disk_permit,
+        }
+    }
+}
+
+impl<R> AsyncRead for DiskReadPermitReader<R>
+where
+    R: AsyncRead,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
     }
 }
 
@@ -1973,16 +1999,16 @@ impl DefaultObjectUsecase {
         })
     }
 
-    async fn acquire_get_object_io_planning<'a>(
-        manager: &'a ConcurrencyManager,
+    async fn acquire_get_object_io_planning(
+        manager: &ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
         timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
-    ) -> S3Result<GetObjectIoPlanning<'a>> {
+    ) -> S3Result<GetObjectIoPlanning> {
         let permit_wait_start = std::time::Instant::now();
         let disk_permit = manager
-            .acquire_disk_read_permit()
+            .acquire_owned_disk_read_permit()
             .await
             .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
@@ -2018,7 +2044,7 @@ impl DefaultObjectUsecase {
         Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
 
         Ok(GetObjectIoPlanning {
-            _disk_permit: disk_permit,
+            disk_permit,
             permit_wait_duration,
             queue_status,
             queue_utilization,
@@ -2076,9 +2102,9 @@ impl DefaultObjectUsecase {
         })
     }
     #[allow(clippy::too_many_arguments)]
-    async fn prepare_get_object_read_execution<'a>(
+    async fn prepare_get_object_read_execution(
         req: &S3Request<GetObjectInput>,
-        manager: &'a ConcurrencyManager,
+        manager: &ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
         timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
@@ -2086,7 +2112,7 @@ impl DefaultObjectUsecase {
         rs: Option<HTTPRangeSpec>,
         opts: &ObjectOptions,
         part_number: Option<usize>,
-    ) -> S3Result<GetObjectPreparedRead<'a>> {
+    ) -> S3Result<GetObjectPreparedRead> {
         let h = req.headers.clone();
         let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
         let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -3332,9 +3358,12 @@ impl DefaultObjectUsecase {
         )
         .await?;
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
-        let permit_wait_duration = io_planning.permit_wait_duration;
-        let queue_status = io_planning.queue_status;
-        let queue_utilization = io_planning.queue_utilization;
+        let GetObjectIoPlanning {
+            disk_permit,
+            permit_wait_duration,
+            queue_status,
+            queue_utilization,
+        } = io_planning;
 
         let GetObjectReadSetup {
             info,
@@ -3351,6 +3380,7 @@ impl DefaultObjectUsecase {
             ssekms_key_id,
             encryption_applied,
         } = read_setup;
+        let final_stream = wrap_reader(DiskReadPermitReader::new(final_stream, disk_permit));
 
         let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
@@ -6012,6 +6042,22 @@ mod tests {
             .expect_err("stalled reader should return an error");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn disk_read_permit_reader_holds_permit_until_reader_is_dropped() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore should grant owned permit");
+
+        let reader = DiskReadPermitReader::new(std::io::Cursor::new(Vec::<u8>::new()), permit);
+        assert_eq!(semaphore.available_permits(), 0);
+
+        drop(reader);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[tokio::test]
