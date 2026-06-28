@@ -29,6 +29,7 @@ use crate::io_support::bitrot::create_deferred_bitrot_reader;
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
+use rustfs_concurrency::{AdmissionState, WorkloadClass};
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
     collections::HashMap,
@@ -568,6 +569,37 @@ enum ReadRepairAdmissionOutcome {
 type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
 type ReadRepairAdmissionSubmitter = fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
 
+fn foreground_read_pressure_for_read_repair() -> Option<(usize, usize, Option<usize>)> {
+    let threshold_pct = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT,
+        rustfs_config::DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT,
+    )
+    .min(100);
+    if threshold_pct == 0 {
+        return None;
+    }
+
+    let provider = runtime_sources::workload_admission_snapshot_provider()?;
+    let registry = provider.workload_admission_snapshot();
+    let snapshot = registry.get(WorkloadClass::ForegroundRead)?;
+    let usage_pct = if matches!(snapshot.state, AdmissionState::Saturated) {
+        100
+    } else {
+        let limit = snapshot.limit?;
+        if limit == 0 {
+            return None;
+        }
+        snapshot
+            .active
+            .unwrap_or(0)
+            .saturating_mul(100)
+            .checked_div(limit)
+            .unwrap_or(100)
+    };
+
+    (usage_pct >= threshold_pct).then_some((usage_pct, threshold_pct, snapshot.active))
+}
+
 struct ReadRepairHealSubmission<'a> {
     bucket: &'a str,
     object: &'a str,
@@ -625,6 +657,27 @@ async fn submit_read_repair_heal_with_submitter(
         reason,
     } = submission;
 
+    if let Some((foreground_read_usage_pct, threshold_pct, active_reads)) = foreground_read_pressure_for_read_repair() {
+        counter!(
+            "rustfs_heal_read_repair_deferred_total",
+            "reason" => "foreground_read_pressure"
+        )
+        .increment(1);
+        debug!(
+            bucket,
+            object,
+            part_number,
+            pool_index,
+            set_index,
+            reason,
+            foreground_read_usage_pct,
+            threshold_pct,
+            active_reads,
+            "Skipped read-repair heal request under foreground read pressure"
+        );
+        return;
+    }
+
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
@@ -638,7 +691,7 @@ async fn submit_read_repair_heal_with_submitter(
         bucket.to_string(),
         Some(object.to_string()),
         false,
-        Some(HealChannelPriority::Normal),
+        Some(HealChannelPriority::Low),
         Some(pool_index),
         Some(set_index),
     );
@@ -2315,10 +2368,13 @@ mod metadata_cache_tests {
     use super::*;
     use rustfs_common::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CAPTURED_READ_REPAIR_PRIORITY: Mutex<Option<HealChannelPriority>> = Mutex::new(None);
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2332,6 +2388,15 @@ mod metadata_cache_tests {
         DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+        })
+    }
+
+    fn capture_read_repair_submitter(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = Some(request.priority);
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted)
         })
     }
 
@@ -2516,6 +2581,41 @@ mod metadata_cache_tests {
 
         assert_eq!(DROPPED_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed), 1);
         release_read_repair_heal_reservation(&released_key).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_uses_low_priority() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = None;
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
+            capture_read_repair_submitter,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background read-repair submitter should be called");
+
+        assert_eq!(
+            *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned"),
+            Some(HealChannelPriority::Low)
+        );
     }
 
     #[test]
