@@ -29,6 +29,7 @@ use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeRead
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
@@ -646,6 +647,69 @@ fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Vec
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn schedule_lockstep_read<'a, R>(
+    sets: &mut FuturesUnordered<ShardReadFuture<'a>>,
+    reader: &'a mut Option<BitrotReader<R>>,
+    buffers: &mut ShardBufferPool,
+    active_readers: &mut [bool],
+    scheduled: &mut usize,
+    index: usize,
+    read_costs: &[ShardReadCost],
+    shard_size: usize,
+    data_shards: usize,
+    read_timeout: Duration,
+    metrics_path: Option<&'static str>,
+) where
+    R: AsyncRead + Unpin + Send + Sync + 'a,
+{
+    let read_cost = read_costs.get(index).copied().unwrap_or(ShardReadCost::Unknown);
+    let recycled_buf = Some(buffers.take(index, shard_size));
+    *scheduled += 1;
+    active_readers[index] = true;
+    sets.push(read_shard(
+        index,
+        read_cost,
+        reader,
+        recycled_buf,
+        shard_size,
+        data_shards,
+        read_timeout,
+        metrics_path,
+    ));
+}
+
+/// Attempt to bring an as-yet-unread parity reader into the lockstep read set at
+/// `stripe_index` without borrowing the whole [`ParallelReader`]. Used while
+/// other shard read futures still hold disjoint mutable reader slots.
+fn try_engage_parity_slot<R>(
+    engaged: &mut [bool],
+    deferred_handles: &[Option<DeferredReaderStripeHandle>],
+    reader: &mut Option<BitrotReader<R>>,
+    idx: usize,
+    stripe_index: usize,
+) -> bool {
+    if stripe_index == 0 {
+        engaged[idx] = true;
+        return true;
+    }
+    let advanced = deferred_handles
+        .get(idx)
+        .and_then(|handle| handle.as_ref())
+        .is_some_and(|handle| handle.advance_stripes(stripe_index));
+    if advanced {
+        engaged[idx] = true;
+        true
+    } else {
+        warn!(
+            shard_index = idx,
+            stripe_index, "retiring parity reader that cannot be aligned to the current stripe"
+        );
+        *reader = None;
+        false
+    }
+}
+
 fn lockstep_has_safe_decode_quorum(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
     let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
     if available_shards < data_shards {
@@ -1078,20 +1142,6 @@ where
             }
         }
 
-        // Pre-claim per-slot buffers so the `self.readers` borrow below stays
-        // disjoint from `self.buffers`.
-        let participating: Vec<bool> = (0..num_readers)
-            .map(|i| self.engaged[i] && self.readers[i].is_some())
-            .collect();
-        let mut bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_readers);
-        for (i, participates) in participating.iter().enumerate() {
-            bufs.push(if *participates {
-                Some(self.buffers.take(i, shard_size))
-            } else {
-                None
-            });
-        }
-
         let data_shards = self.data_shards;
         let read_timeout = self.read_timeout;
         let metrics_path = self.metrics_path;
@@ -1110,40 +1160,86 @@ where
         // before the retirement pass mutates `self.readers` below.
         {
             let mut sets = FuturesUnordered::new();
-            let reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
+            let readers = &mut self.readers;
+            let buffers = &mut self.buffers;
+            let engaged = &mut self.engaged;
+            let deferred_handles = &self.deferred_handles;
+            let reader_iter = ReaderLaunchIter::new(readers, &read_costs, locality_preference_enabled);
+            let mut deferred_launches = VecDeque::new();
             for (i, reader) in reader_iter {
-                if reader.is_none() || !participating[i] {
+                if reader.is_none() {
                     continue;
                 }
-                let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
-                let recycled_buf = bufs[i].take();
-                scheduled += 1;
-                active_readers[i] = true;
-                sets.push(read_shard(
-                    i,
-                    read_cost,
-                    reader,
-                    recycled_buf,
-                    shard_size,
-                    data_shards,
-                    read_timeout,
-                    metrics_path,
-                ));
+                if engaged[i] {
+                    schedule_lockstep_read(
+                        &mut sets,
+                        reader,
+                        buffers,
+                        &mut active_readers,
+                        &mut scheduled,
+                        i,
+                        &read_costs,
+                        shard_size,
+                        data_shards,
+                        read_timeout,
+                        metrics_path,
+                    );
+                } else {
+                    deferred_launches.push_back((i, reader));
+                }
             }
 
             let mut quorum_grace = None;
+            let mut no_quorum_hedge = None;
             loop {
-                if quorum_grace.is_none()
-                    && lockstep_has_safe_decode_quorum(&shards, data_shards)
-                    && let Some(grace_delay) = shard_read_hedge_delay(read_timeout)
+                if lockstep_has_safe_decode_quorum(&shards, data_shards) {
+                    no_quorum_hedge = None;
+                    if quorum_grace.is_none()
+                        && let Some(grace_delay) = shard_read_hedge_delay(read_timeout)
+                    {
+                        quorum_grace = Some(Box::pin(tokio::time::sleep(grace_delay)));
+                    }
+                } else if no_quorum_hedge.is_none()
+                    && !deferred_launches.is_empty()
+                    && let Some(hedge_delay) = shard_read_hedge_delay(read_timeout)
                 {
-                    quorum_grace = Some(Box::pin(tokio::time::sleep(grace_delay)));
+                    no_quorum_hedge = Some(Box::pin(tokio::time::sleep(hedge_delay)));
                 }
 
                 let item = if let Some(grace) = quorum_grace.as_mut() {
                     tokio::select! {
                         item = sets.next() => item,
                         _ = grace.as_mut() => break,
+                    }
+                } else if let Some(hedge) = no_quorum_hedge.as_mut() {
+                    tokio::select! {
+                        item = sets.next() => item,
+                        _ = hedge.as_mut() => {
+                            no_quorum_hedge = None;
+                            while let Some((idx, reader)) = deferred_launches.pop_front() {
+                                if reader.is_none() {
+                                    continue;
+                                }
+                                if !try_engage_parity_slot(engaged, deferred_handles, reader, idx, stripe_index) {
+                                    continue;
+                                }
+                                schedule_lockstep_read(
+                                    &mut sets,
+                                    reader,
+                                    buffers,
+                                    &mut active_readers,
+                                    &mut scheduled,
+                                    idx,
+                                    &read_costs,
+                                    shard_size,
+                                    data_shards,
+                                    read_timeout,
+                                    metrics_path,
+                                );
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 } else {
                     sets.next().await
@@ -1169,6 +1265,31 @@ where
                         errs[i] = Some(e);
                         retire_readers.push(i);
                         failed += 1;
+                        if !lockstep_has_safe_decode_quorum(&shards, data_shards) {
+                            no_quorum_hedge = None;
+                            while let Some((idx, reader)) = deferred_launches.pop_front() {
+                                if reader.is_none() {
+                                    continue;
+                                }
+                                if !try_engage_parity_slot(engaged, deferred_handles, reader, idx, stripe_index) {
+                                    continue;
+                                }
+                                schedule_lockstep_read(
+                                    &mut sets,
+                                    reader,
+                                    buffers,
+                                    &mut active_readers,
+                                    &mut scheduled,
+                                    idx,
+                                    &read_costs,
+                                    shard_size,
+                                    data_shards,
+                                    read_timeout,
+                                    metrics_path,
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2841,53 +2962,114 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_lockstep_does_not_wait_for_slow_parity_after_data_quorum() {
-        const BLOCK_SIZE: usize = 64;
-        const DATA_SHARDS: usize = 2;
-        const PARITY_SHARDS: usize = 2;
-        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, None::<&str>)], async {
+            const BLOCK_SIZE: usize = 64;
+            const DATA_SHARDS: usize = 2;
+            const PARITY_SHARDS: usize = 2;
+            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
 
-        let hash_algo = HashAlgorithm::None;
-        let readers = vec![
-            Some(BitrotReader::new(
-                TestShardReader::Ready(Cursor::new(vec![0_u8; SHARD_SIZE])),
-                SHARD_SIZE,
-                hash_algo.clone(),
-                false,
-            )),
-            Some(BitrotReader::new(
-                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
-                SHARD_SIZE,
-                hash_algo.clone(),
-                false,
-            )),
-            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
-            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo, false)),
-        ];
+            let hash_algo = HashAlgorithm::None;
+            let readers = vec![
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(vec![0_u8; SHARD_SIZE])),
+                    SHARD_SIZE,
+                    hash_algo.clone(),
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
+                    SHARD_SIZE,
+                    hash_algo.clone(),
+                    false,
+                )),
+                Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+                Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo, false)),
+            ];
 
-        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
-            readers,
-            erasure,
-            0,
-            BLOCK_SIZE,
-            None,
-            Duration::from_secs(60),
-            true,
-        );
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                erasure,
+                0,
+                BLOCK_SIZE,
+                None,
+                Duration::from_secs(60),
+                true,
+            );
 
-        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
-            .await
-            .expect("lockstep reader should emit once data quorum is safe");
+            let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+                .await
+                .expect("lockstep reader should emit once data quorum is safe");
 
-        assert!(bufs[0].is_some());
-        assert!(bufs[1].is_some());
-        assert!(bufs[2].is_none());
-        assert!(bufs[3].is_none());
-        assert!(matches!(&errs[2], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
-        assert!(matches!(&errs[3], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
-        assert!(parallel_reader.readers[2].is_none());
-        assert!(parallel_reader.readers[3].is_none());
+            assert!(bufs[0].is_some());
+            assert!(bufs[1].is_some());
+            assert!(bufs[2].is_none());
+            assert!(bufs[3].is_none());
+            assert!(matches!(&errs[2], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+            assert!(matches!(&errs[3], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+            assert!(parallel_reader.readers[2].is_none());
+            assert!(parallel_reader.readers[3].is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_lockstep_hedges_deferred_parity_before_slow_data_timeout() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))], async {
+            const BLOCK_SIZE: usize = 64;
+            const DATA_SHARDS: usize = 2;
+            const PARITY_SHARDS: usize = 2;
+            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+            let hash_algo = HashAlgorithm::None;
+            let readers = vec![
+                Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
+                    SHARD_SIZE,
+                    hash_algo.clone(),
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE])),
+                    SHARD_SIZE,
+                    hash_algo.clone(),
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE])),
+                    SHARD_SIZE,
+                    hash_algo,
+                    false,
+                )),
+            ];
+
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                erasure,
+                0,
+                BLOCK_SIZE,
+                None,
+                Duration::from_secs(60),
+                true,
+            );
+
+            let (bufs, errs) = tokio::time::timeout(Duration::from_millis(700), parallel_reader.read())
+                .await
+                .expect("lockstep reader should hedge parity instead of waiting for a slow data shard timeout");
+
+            assert!(bufs[0].is_none());
+            assert!(bufs[1].is_some());
+            assert!(bufs[2].is_some());
+            assert!(bufs[3].is_some());
+            assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+            assert!(parallel_reader.readers[0].is_none());
+        })
+        .await;
     }
 
     #[tokio::test]
