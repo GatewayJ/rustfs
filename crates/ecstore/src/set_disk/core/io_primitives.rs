@@ -71,7 +71,11 @@ pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: &str =
     "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP";
+const DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: bool = true;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: bool = false;
 pub(in crate::set_disk) const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
+const BITROT_READER_SETUP_HEDGE_DELAY_MAX: Duration = Duration::from_secs(2);
+const BITROT_READER_SETUP_HEDGE_DELAY_MIN: Duration = Duration::from_millis(250);
 pub(in crate::set_disk) const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 pub(in crate::set_disk) const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
 
@@ -989,13 +993,20 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 ) -> BitrotReaderSetupStrategy {
     match mode {
         BitrotReaderSetupMode::ReadQuorum
-            if prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+            if prefer_data_blocks_first
+                || rustfs_utils::get_env_bool(
+                    ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                    DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                ) =>
         {
             BitrotReaderSetupStrategy::DataBlocksFirst
         }
         BitrotReaderSetupMode::VerifyReconstruction
             if prefer_data_blocks_first
-                || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+                || rustfs_utils::get_env_bool(
+                    ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
+                    DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
+                ) =>
         {
             BitrotReaderSetupStrategy::DataBlocksFirst
         }
@@ -1200,6 +1211,30 @@ pub(in crate::set_disk) fn next_unscheduled_reader_index(
     (data_shards..total_shards)
         .chain(0..data_shards.min(total_shards))
         .find(|idx| !setup.scheduled[*idx])
+}
+
+fn bitrot_reader_setup_hedge_delay(read_timeout: Duration) -> Option<Duration> {
+    if read_timeout.is_zero() {
+        None
+    } else {
+        Some((read_timeout / 4).clamp(BITROT_READER_SETUP_HEDGE_DELAY_MIN, BITROT_READER_SETUP_HEDGE_DELAY_MAX))
+    }
+}
+
+fn should_hedge_bitrot_reader_setup(
+    setup: &BitrotReaderSetup,
+    total_shards: usize,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+) -> bool {
+    if setup.has_setup_quorum(data_shards, parity_shards, mode) || setup.pending_scheduled_shards() == 0 {
+        return false;
+    }
+
+    let target = setup.scheduling_target(data_shards, parity_shards, mode);
+    setup.available_shards().saturating_add(setup.pending_scheduled_shards()) >= target
+        && next_unscheduled_reader_index(setup, total_shards, data_shards).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1550,15 +1585,58 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     }
 
     let wait_quorum_stage_start = stage_metrics.map(|_| Instant::now());
-    while let Some((idx, result)) = reader_tasks.next().await {
-        setup.apply_reader_result(idx, result);
-
-        if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+    let setup_hedge_delay = bitrot_reader_setup_hedge_delay(crate::disk::disk_store::get_object_disk_read_timeout());
+    let mut setup_hedge_timer = setup_hedge_delay.map(|delay| Box::pin(tokio::time::sleep(delay)));
+    loop {
+        if setup.has_setup_quorum(data_shards, parity_shards, mode) || reader_tasks.is_empty() {
             break;
         }
 
+        let should_hedge_setup = setup_hedge_timer.is_some()
+            && should_hedge_bitrot_reader_setup(&setup, total_shards, data_shards, parity_shards, mode);
+
+        tokio::select! {
+            maybe_result = reader_tasks.next() => {
+                let Some((idx, result)) = maybe_result else {
+                    break;
+                };
+                setup.apply_reader_result(idx, result);
+
+                if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+                    break;
+                }
+            }
+            _ = async {
+                if let Some(timer) = setup_hedge_timer.as_mut() {
+                    timer.as_mut().await;
+                }
+            }, if should_hedge_setup => {
+                if let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) {
+                    schedule_bitrot_reader_task(
+                        &mut reader_tasks,
+                        &mut setup,
+                        next_idx,
+                        files,
+                        disks,
+                        bucket,
+                        object,
+                        part_number,
+                        read_offset,
+                        read_length,
+                        shard_size,
+                        checksum_algo.clone(),
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        stage_metrics,
+                    );
+                }
+            }
+        }
+
         let target = setup.scheduling_target(data_shards, parity_shards, mode);
-        while setup.available_shards().saturating_add(setup.pending_scheduled_shards()) < target {
+        while !setup.has_setup_quorum(data_shards, parity_shards, mode)
+            && setup.available_shards().saturating_add(setup.pending_scheduled_shards()) < target
+        {
             let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) else {
                 break;
             };
@@ -1580,6 +1658,8 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
                 stage_metrics,
             );
         }
+
+        setup_hedge_timer = setup_hedge_delay.map(|delay| Box::pin(tokio::time::sleep(delay)));
     }
     if let Some(stage_metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
@@ -4199,6 +4279,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn bitrot_reader_setup_tracks_strategy_counters_and_deferred_readers() {
+        temp_env::with_var_unset(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
+                BitrotReaderSetupStrategy::DataBlocksFirst
+            ));
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("false"), || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
+                BitrotReaderSetupStrategy::AllShards
+            ));
+        });
         temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true"), || {
             assert!(matches!(
                 get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
@@ -4258,6 +4350,85 @@ mod tests {
         assert_eq!(setup.deferred_shards(), 1);
         assert!(setup.readers[3].is_some());
         assert!(setup.errors[3].is_none());
+    }
+
+    #[test]
+    fn bitrot_reader_setup_hedge_delay_is_bounded() {
+        assert_eq!(bitrot_reader_setup_hedge_delay(Duration::ZERO), None);
+        assert_eq!(
+            bitrot_reader_setup_hedge_delay(Duration::from_millis(400)),
+            Some(BITROT_READER_SETUP_HEDGE_DELAY_MIN)
+        );
+        assert_eq!(
+            bitrot_reader_setup_hedge_delay(Duration::from_secs(10)),
+            Some(BITROT_READER_SETUP_HEDGE_DELAY_MAX)
+        );
+        assert_eq!(
+            bitrot_reader_setup_hedge_delay(Duration::from_secs(60)),
+            Some(BITROT_READER_SETUP_HEDGE_DELAY_MAX)
+        );
+    }
+
+    #[test]
+    fn bitrot_reader_setup_hedges_when_pending_data_holds_read_quorum_budget() {
+        let mut setup = BitrotReaderSetup::new(4);
+        assert!(setup.mark_scheduled(0));
+        assert!(setup.mark_scheduled(1));
+        setup.apply_reader_result(0, Ok(Some(test_object_bitrot_reader())));
+
+        assert_eq!(setup.available_shards(), 1);
+        assert_eq!(setup.pending_scheduled_shards(), 1);
+        assert!(should_hedge_bitrot_reader_setup(&setup, 4, 2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(next_unscheduled_reader_index(&setup, 4, 2), Some(2));
+
+        assert!(setup.mark_scheduled(2));
+        setup.apply_reader_result(2, Ok(Some(test_object_bitrot_reader())));
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert!(!setup.data_shards_attempted(2));
+        assert!(!should_hedge_bitrot_reader_setup(&setup, 4, 2, 2, BitrotReaderSetupMode::ReadQuorum));
+    }
+
+    #[test]
+    fn bitrot_reader_setup_hedge_keeps_reconstruction_verification_quorum() {
+        let mut setup = BitrotReaderSetup::new(4);
+        assert!(setup.mark_scheduled(0));
+        assert!(setup.mark_scheduled(1));
+        setup.apply_reader_result(0, Ok(Some(test_object_bitrot_reader())));
+
+        assert!(should_hedge_bitrot_reader_setup(
+            &setup,
+            4,
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction
+        ));
+
+        assert!(setup.mark_scheduled(2));
+        setup.apply_reader_result(2, Ok(Some(test_object_bitrot_reader())));
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert!(!setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert!(should_hedge_bitrot_reader_setup(
+            &setup,
+            4,
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction
+        ));
+
+        assert!(setup.mark_scheduled(3));
+        setup.apply_reader_result(3, Ok(Some(test_object_bitrot_reader())));
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert!(!should_hedge_bitrot_reader_setup(
+            &setup,
+            4,
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction
+        ));
     }
 
     #[tokio::test]

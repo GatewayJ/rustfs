@@ -121,10 +121,10 @@ const DEFAULT_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE: bool = false;
 /// stripe via their stripe handle — only when a data shard is missing or dies.
 /// This halves per-GET read bytes, IOPS, and bitrot hashing on healthy
 /// objects with 2+2 layouts.
-/// Default: false (current behavior: every live shard reader is read on every
-/// stripe).
+/// Default: true. The legacy all-shards behavior remains available by setting
+/// `RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE=false`.
 const ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: &str = "RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE";
-const DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: bool = true;
 
 /// Whether the data-shards-only lockstep GET read is enabled (backlog#923).
 pub(crate) fn get_lockstep_data_shards_only_enabled() -> bool {
@@ -2923,14 +2923,14 @@ mod tests {
         (DATA_SHARDS, counters.iter().map(|counter| counter.load(Ordering::SeqCst)).collect())
     }
 
-    /// Merge gate for backlog#923: with the gate on, the healthy lockstep GET
+    /// Merge gate for backlog#923: by default, the healthy lockstep GET
     /// path must read only the data shards — parity readers stay unopened and
     /// contribute zero read bytes. This is the call-count proof of the 2x read
     /// amplification fix (2+2 layout reads 2 shards per stripe, not 4).
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_lockstep_healthy_get_reads_only_data_shards() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))], async {
+    async fn test_lockstep_default_reads_only_data_shards() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, None::<&str>)], async {
             let (data_shards, shard_bytes) = healthy_lockstep_shard_bytes().await;
             for (i, bytes) in shard_bytes.iter().enumerate() {
                 if i < data_shards {
@@ -2946,16 +2946,16 @@ mod tests {
         .await;
     }
 
-    /// Compatibility lock: with the gate off (default), the lockstep path
+    /// Compatibility lock: with the gate explicitly off, the lockstep path
     /// keeps the pre-backlog#923 behavior and reads every live shard —
     /// including parity — on every stripe.
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_lockstep_default_reads_all_shards_per_stripe() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, None::<&str>)], async {
+    async fn test_lockstep_gate_off_reads_all_shards_per_stripe() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("false"))], async {
             let (_data_shards, shard_bytes) = healthy_lockstep_shard_bytes().await;
             for (i, bytes) in shard_bytes.iter().enumerate() {
-                assert!(*bytes > 0, "default lockstep behavior must read shard {i} on every stripe");
+                assert!(*bytes > 0, "gate-off lockstep behavior must read shard {i} on every stripe");
             }
         })
         .await;
@@ -2964,7 +2964,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_lockstep_does_not_wait_for_slow_parity_after_data_quorum() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, None::<&str>)], async {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("false"))], async {
             const BLOCK_SIZE: usize = 64;
             const DATA_SHARDS: usize = 2;
             const PARITY_SHARDS: usize = 2;

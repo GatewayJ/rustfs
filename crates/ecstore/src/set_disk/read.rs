@@ -4007,12 +4007,12 @@ mod tests {
     /// backlog#923: with the data-shards-only lockstep gate on, every retained
     /// parity reader must be an unopened deferred reader carrying a stripe
     /// handle, so the decode path can realign it to a mid-object stripe. With
-    /// the gate off (default), eagerly opened parity readers are kept exactly
+    /// the gate explicitly off, eagerly opened parity readers are kept exactly
     /// as before and carry no handles.
     #[tokio::test]
     #[serial_test::serial]
     async fn bitrot_reader_setup_gates_parity_stripe_handle_conversion() {
-        for enabled in [None, Some("true")] {
+        for (enabled, expect_handle) in [(None, true), (Some("true"), true), (Some("false"), false)] {
             // A missing data shard forces the VerifyReconstruction quorum to 3,
             // so both parity slots complete eagerly (attempted + ready) before
             // the deferred fill runs.
@@ -4034,12 +4034,12 @@ mod tests {
                 assert!(setup.readers[idx].is_some(), "parity slot {idx} must keep a reader (enabled={enabled:?})");
                 assert_eq!(
                     setup.deferred_stripe_handles[idx].is_some(),
-                    enabled.is_some(),
+                    expect_handle,
                     "parity slot {idx} stripe handle must match the gate (enabled={enabled:?})"
                 );
             }
 
-            if enabled.is_some() {
+            if expect_handle {
                 // The converted parity reader is still unopened: its handle
                 // accepts a stripe advance, and reading it yields the shard
                 // bytes (block 0 here).
