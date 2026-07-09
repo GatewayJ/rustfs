@@ -1355,17 +1355,19 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<crate::disk::FileReader> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_stream",
             || async { self.disk.read_file_stream(volume, path, offset, length).await },
-            get_max_timeout_duration(),
+            get_object_disk_read_timeout(),
         )
         .await
     }
 
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_mmap_copy",
             || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
-            get_max_timeout_duration(),
+            get_object_disk_read_timeout(),
         )
         .await
     }
@@ -1378,13 +1380,14 @@ impl DiskAPI for LocalDiskWrapper {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<bytes::Bytes> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "read_file_mmap_copy_with_metrics",
             || async {
                 self.disk
                     .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
                     .await
             },
-            get_max_timeout_duration(),
+            get_object_disk_read_timeout(),
         )
         .await
     }
