@@ -646,6 +646,21 @@ fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Vec
     }
 }
 
+fn lockstep_has_safe_decode_quorum(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
+    let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+    if available_shards < data_shards {
+        return false;
+    }
+
+    if shards.iter().take(data_shards).all(Option::is_some) {
+        return true;
+    }
+
+    // If a data shard is absent, keep one extra source shard so
+    // reconstruction verification remains active.
+    available_shards > data_shards
+}
+
 fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     if read_timeout.is_zero() {
         None
@@ -1090,6 +1105,7 @@ where
         let mut completed = 0usize;
         let mut failed = 0usize;
         let mut first_shard_recorded = false;
+        let mut active_readers = vec![false; num_readers];
         // Scope the reader borrow (held by `reader_iter`/`sets`) so it is released
         // before the retirement pass mutates `self.readers` below.
         {
@@ -1102,6 +1118,7 @@ where
                 let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                 let recycled_buf = bufs[i].take();
                 scheduled += 1;
+                active_readers[i] = true;
                 sets.push(read_shard(
                     i,
                     read_cost,
@@ -1114,7 +1131,28 @@ where
                 ));
             }
 
-            while let Some((i, _read_cost, result, _should_retire)) = sets.next().await {
+            let mut quorum_grace = None;
+            loop {
+                if quorum_grace.is_none()
+                    && lockstep_has_safe_decode_quorum(&shards, data_shards)
+                    && let Some(grace_delay) = shard_read_hedge_delay(read_timeout)
+                {
+                    quorum_grace = Some(Box::pin(tokio::time::sleep(grace_delay)));
+                }
+
+                let item = if let Some(grace) = quorum_grace.as_mut() {
+                    tokio::select! {
+                        item = sets.next() => item,
+                        _ = grace.as_mut() => break,
+                    }
+                } else {
+                    sets.next().await
+                };
+
+                let Some((i, _read_cost, result, _should_retire)) = item else {
+                    break;
+                };
+                active_readers[i] = false;
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = metrics_path {
@@ -1134,6 +1172,10 @@ where
                     }
                 }
             }
+        }
+
+        if lockstep_has_safe_decode_quorum(&shards, data_shards) {
+            retire_abandoned_readers(&mut errs, &mut retire_readers, &active_readers);
         }
 
         // A data shard may have died during this stripe's reads. The unengaged
@@ -2796,6 +2838,100 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_does_not_wait_for_slow_parity_after_data_quorum() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![0_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo, false)),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            BLOCK_SIZE,
+            None,
+            Duration::from_secs(60),
+            true,
+        );
+
+        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("lockstep reader should emit once data quorum is safe");
+
+        assert!(bufs[0].is_some());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_none());
+        assert!(bufs[3].is_none());
+        assert!(matches!(&errs[2], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(matches!(&errs[3], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[2].is_none());
+        assert!(parallel_reader.readers[3].is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_reconstructs_without_waiting_for_slow_data_when_parity_can_verify() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let data: Vec<u8> = (0..BLOCK_SIZE as u8).collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, shard_size, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(encoded[1].to_vec())),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(encoded[2].to_vec())),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(encoded[3].to_vec())),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+
+        let mut output = Vec::new();
+        let (written, err) = tokio::time::timeout(Duration::from_millis(500), async {
+            erasure.decode(&mut output, readers, 0, data.len(), data.len()).await
+        })
+        .await
+        .expect("decode should use parity quorum instead of waiting for the slow data shard");
+
+        assert!(err.is_none(), "unexpected decode error: {err:?}");
+        assert_eq!(written, data.len());
+        assert_eq!(output, data);
     }
 
     /// Merge gate for backlog#923: reconstruction verification must stay
