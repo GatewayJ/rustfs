@@ -94,10 +94,10 @@ pub(crate) fn should_collect_shard_read_costs() -> bool {
 
 /// Number of stripes to prefetch in the legacy decode path.
 /// When > 1, stripe reads are batched to overlap disk I/O with decode.
-/// Default: 1 (no prefetch, current behavior).
+/// Values above 1 collapse to the current depth-1 implementation.
 /// Set via environment variable RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT.
 const ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT: &str = "RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT";
-const DEFAULT_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT: usize = 1;
+const DEFAULT_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT: usize = 2;
 
 /// Get the stripe prefetch count from environment variable.
 fn get_decode_stripe_prefetch_count() -> usize {
@@ -158,9 +158,11 @@ fn is_bitrot_decode_overlap_enabled() -> bool {
 /// and emitted (depth 1). A prefetch count above 1 therefore collapses to the
 /// same single-stripe-ahead pipeline rather than reading several stripes ahead.
 ///
-/// Default (`count == 1`, `overlap == false`) => disabled => the loop keeps its
-/// pre-existing strictly-serial read → reconstruct → emit behaviour, byte for
-/// byte.
+/// Default (`count > 1`) => enabled => the loop hides one stripe read under
+/// the previous stripe's reconstruct/emit work. Operators can still force the
+/// pre-existing strictly-serial behavior with
+/// `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=1` and
+/// `RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE=false`.
 fn legacy_stripe_prefetch_enabled() -> bool {
     get_decode_stripe_prefetch_count() > 1 || is_bitrot_decode_overlap_enabled()
 }
@@ -1828,54 +1830,65 @@ impl Erasure {
             //   one-stripe lag.
             let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
-            // Block geometries to emit, stopping at the first zero-length block
-            // exactly as the serial loop's `break` did.
-            let mut blocks = Vec::with_capacity(end - start + 1);
-            for i in start..=end {
-                let geometry = block_geometry(i);
-                if geometry.1 == 0 {
-                    break;
-                }
-                blocks.push(geometry);
-            }
+            let mut block_indices = start..=end;
+            let first_geometry = block_indices.next().map(block_geometry);
 
-            if !blocks.is_empty() {
-                // Prime the first stripe read. `current` holds the stripe to
-                // process next; `take()` moves it out cleanly per iteration and
-                // the prefetch branch refills it with the overlapping read.
-                let mut current = Some(read_stripe_timed(&mut reader, stage_metrics_enabled).await);
+            if let Some(first_geometry) = first_geometry.filter(|(_, block_length)| *block_length != 0) {
+                let mut current = Some((first_geometry, read_stripe_timed(&mut reader, stage_metrics_enabled).await));
 
-                for idx in 0..blocks.len() {
-                    let (block_offset, block_length) = blocks[idx];
-                    let Some((mut shards, errs)) = current.take() else {
-                        break;
-                    };
+                while let Some(((block_offset, block_length), (mut shards, errs))) = current.take() {
+                    let next_geometry = block_indices
+                        .next()
+                        .map(block_geometry)
+                        .filter(|(_, next_block_length)| *next_block_length != 0);
 
-                    if idx + 1 < blocks.len() {
-                        // Overlap: read stripe idx+1 while reconstructing/emitting idx.
-                        let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
-                        let emit_fut = self.emit_decoded_stripe(
-                            writer,
-                            &mut shards,
-                            &errs,
-                            block_offset,
-                            block_length,
-                            &mut written,
-                            &mut ret_err,
-                            stage_metrics_enabled,
-                        );
-                        let (next, flow) = tokio::join!(read_fut, emit_fut);
+                    if let Some(next_geometry) = next_geometry {
+                        // Overlap: read the next stripe while reconstructing/emitting the
+                        // current stripe. If the writer stops first (for example because
+                        // the client disconnected), cancel the speculative read instead of
+                        // waiting for a disk timeout.
+                        let (next, flow) = {
+                            let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
+                            tokio::pin!(read_fut);
+                            let emit_fut = self.emit_decoded_stripe(
+                                writer,
+                                &mut shards,
+                                &errs,
+                                block_offset,
+                                block_length,
+                                &mut written,
+                                &mut ret_err,
+                                stage_metrics_enabled,
+                            );
+                            tokio::pin!(emit_fut);
+
+                            let mut next = None;
+                            let flow;
+                            tokio::select! {
+                                prefetched = &mut read_fut => {
+                                    next = Some(prefetched);
+                                    flow = (&mut emit_fut).await;
+                                }
+                                emitted = &mut emit_fut => {
+                                    flow = emitted;
+                                    if matches!(flow, StripeFlow::Continue) {
+                                        next = Some((&mut read_fut).await);
+                                    }
+                                }
+                            }
+                            (next, flow)
+                        };
+
                         match flow {
                             StripeFlow::Continue => {
                                 reader.recycle_shards(&mut shards);
-                                current = Some(next);
+                                if let Some(next) = next {
+                                    current = Some((next_geometry, next));
+                                } else {
+                                    break;
+                                }
                             }
-                            StripeFlow::Stop => {
-                                // `next` is speculative; drop it without surfacing
-                                // its errors against the stripe that stopped.
-                                drop(next);
-                                break;
-                            }
+                            StripeFlow::Stop => break,
                         }
                     } else {
                         // Final stripe: nothing left to prefetch.
@@ -2593,13 +2606,20 @@ mod tests {
     type PrefetchEnvConfig = (&'static str, Vec<(&'static str, Option<&'static str>)>);
 
     /// Prefetch on/off env configurations exercised by the HP-9 tests.
-    /// `serial-default` pins both switches off (the byte-identical serial path);
-    /// the others turn the depth-1 prefetch pipeline on through each switch and
-    /// through a count above 1 (which collapses to depth 1 by design).
+    /// `serial-forced-off` pins both switches off (the byte-identical serial
+    /// path); the others cover the default-on depth-1 prefetch pipeline and
+    /// the explicit switches that also enable it.
     fn prefetch_env_configs() -> Vec<PrefetchEnvConfig> {
         vec![
             (
-                "serial-default",
+                "serial-forced-off",
+                vec![
+                    (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1")),
+                    (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("false")),
+                ],
+            ),
+            (
+                "prefetch-default",
                 vec![
                     (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None),
                     (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None),
@@ -2842,25 +2862,29 @@ mod tests {
         }
     }
 
-    /// The prefetch gate is off by default and turns on through either switch.
+    /// The prefetch gate is on by default and can still be disabled explicitly.
     #[test]
     #[serial_test::serial]
-    fn test_legacy_stripe_prefetch_gate_defaults_off() {
+    fn test_legacy_stripe_prefetch_gate_defaults_on() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None::<&str>),
                 (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None::<&str>),
             ],
-            || assert!(!legacy_stripe_prefetch_enabled(), "prefetch must default off"),
+            || assert!(legacy_stripe_prefetch_enabled(), "prefetch must default on"),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1")),
+                (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("false")),
+            ],
+            || assert!(!legacy_stripe_prefetch_enabled(), "count == 1 and overlap=false must disable prefetch"),
         );
         temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("2"))], || {
             assert!(legacy_stripe_prefetch_enabled(), "count > 1 must enable prefetch");
         });
         temp_env::with_vars([(ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true"))], || {
             assert!(legacy_stripe_prefetch_enabled(), "overlap switch must enable prefetch");
-        });
-        temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1"))], || {
-            assert!(!legacy_stripe_prefetch_enabled(), "count == 1 must stay serial");
         });
     }
 

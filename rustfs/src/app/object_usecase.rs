@@ -187,7 +187,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
@@ -230,6 +230,8 @@ const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
 const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+const GET_OBJECT_STREAM_FULL_BODY_LOG_THRESHOLD: Duration = Duration::from_secs(25);
+const GET_OBJECT_STREAM_FULL_BODY_LOW_THROUGHPUT_BYTES_PER_SEC: f64 = 1024.0 * 1024.0;
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn record_get_object_s3_handler_stage_duration(stage: &'static str, start: Option<std::time::Instant>) {
@@ -871,7 +873,36 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         }
                     }
                     if self.emitted >= self.expected {
-                        self.completed = true;
+                        let elapsed = self.elapsed();
+                        rustfs_io_metrics::record_get_object_full_body_latency(
+                            GET_OBJECT_STAGE_PATH_S3_HANDLER,
+                            elapsed.as_secs_f64(),
+                        );
+                        let elapsed_secs = elapsed.as_secs_f64();
+                        let bytes_per_sec = if elapsed_secs > 0.0 {
+                            self.emitted as f64 / elapsed_secs
+                        } else {
+                            self.emitted as f64
+                        };
+                        if elapsed >= GET_OBJECT_STREAM_FULL_BODY_LOG_THRESHOLD
+                            && bytes_per_sec < GET_OBJECT_STREAM_FULL_BODY_LOW_THROUGHPUT_BYTES_PER_SEC
+                        {
+                            info!(
+                                event = EVENT_GET_OBJECT_STREAM_BODY,
+                                component = LOG_COMPONENT_APP,
+                                subsystem = LOG_SUBSYSTEM_OBJECT,
+                                bucket = %self.bucket,
+                                object = %self.key,
+                                expected = self.expected,
+                                emitted = self.emitted,
+                                elapsed_ms = elapsed.as_millis(),
+                                threshold_ms = GET_OBJECT_STREAM_FULL_BODY_LOG_THRESHOLD.as_millis(),
+                                throughput_bytes_per_sec = bytes_per_sec as u64,
+                                low_throughput_bytes_per_sec = GET_OBJECT_STREAM_FULL_BODY_LOW_THROUGHPUT_BYTES_PER_SEC as u64,
+                                state = "completed_slow",
+                                "GetObject streaming body completed slowly"
+                            );
+                        }
                         self.finish_ok();
                     }
                 } else if self.emitted < self.expected {
