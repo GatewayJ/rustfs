@@ -727,6 +727,11 @@ fn lockstep_has_safe_decode_quorum(shards: &[Option<Vec<u8>>], data_shards: usiz
     available_shards > data_shards
 }
 
+fn lockstep_has_exact_decode_quorum_without_extra_source(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
+    let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+    available_shards == data_shards && shards.iter().take(data_shards).any(Option::is_none)
+}
+
 fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     if read_timeout.is_zero() {
         None
@@ -1192,14 +1197,33 @@ where
             }
 
             let mut quorum_grace = None;
+            let mut exact_quorum_tail_grace = None;
             let mut no_quorum_hedge = None;
+            let mut exact_quorum_tail_fallback = false;
             loop {
                 if lockstep_has_safe_decode_quorum(&shards, data_shards) {
+                    exact_quorum_tail_grace = None;
                     no_quorum_hedge = None;
                     if quorum_grace.is_none()
                         && let Some(grace_delay) = shard_read_hedge_delay(read_timeout)
                     {
                         quorum_grace = Some(Box::pin(tokio::time::sleep(grace_delay)));
+                    }
+                } else if deferred_launches.is_empty()
+                    && lockstep_has_exact_decode_quorum_without_extra_source(&shards, data_shards)
+                {
+                    // All parity candidates have either completed or been ruled out.
+                    // Give in-flight data shards a short chance to provide the extra
+                    // verification source, then fall back to exact-quorum recovery
+                    // instead of stalling the response body until shard timeout.
+                    no_quorum_hedge = None;
+                    if exact_quorum_tail_grace.is_none() {
+                        if let Some(grace_delay) = shard_read_hedge_delay(read_timeout) {
+                            exact_quorum_tail_grace = Some(Box::pin(tokio::time::sleep(grace_delay)));
+                        } else {
+                            exact_quorum_tail_fallback = true;
+                            break;
+                        }
                     }
                 } else if no_quorum_hedge.is_none()
                     && !deferred_launches.is_empty()
@@ -1212,6 +1236,14 @@ where
                     tokio::select! {
                         item = sets.next() => item,
                         _ = grace.as_mut() => break,
+                    }
+                } else if let Some(grace) = exact_quorum_tail_grace.as_mut() {
+                    tokio::select! {
+                        item = sets.next() => item,
+                        _ = grace.as_mut() => {
+                            exact_quorum_tail_fallback = true;
+                            break;
+                        }
                     }
                 } else if let Some(hedge) = no_quorum_hedge.as_mut() {
                     tokio::select! {
@@ -1294,6 +1326,10 @@ where
                         }
                     }
                 }
+            }
+
+            if exact_quorum_tail_fallback {
+                retire_abandoned_readers(&mut errs, &mut retire_readers, &active_readers);
             }
         }
 
@@ -3134,6 +3170,104 @@ mod tests {
         })
         .await
         .expect("decode should use parity quorum instead of waiting for the slow data shard");
+
+        assert!(err.is_none(), "unexpected decode error: {err:?}");
+        assert_eq!(written, data.len());
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_exact_quorum_tail_fallback_does_not_wait_for_slow_data() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let data: Vec<u8> = (0..BLOCK_SIZE as u8).collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, shard_size, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(TestShardReader::Pending, shard_size, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(encoded[2].to_vec())),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(encoded[3].to_vec())),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+
+        let mut output = Vec::new();
+        let (written, err) = tokio::time::timeout(Duration::from_millis(800), async {
+            erasure.decode(&mut output, readers, 0, data.len(), data.len()).await
+        })
+        .await
+        .expect("exact decode quorum should not wait for slow data shard timeouts");
+
+        assert!(err.is_none(), "unexpected decode error: {err:?}");
+        assert_eq!(written, data.len());
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_exact_quorum_tail_fallback_excludes_bitrot_corrupt_source() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let data: Vec<u8> = (0..BLOCK_SIZE as u8).collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let total_shards = DATA_SHARDS + PARITY_SHARDS;
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let hash_size = hash_algo.size();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+        for (writer, shard) in shard_writers.iter_mut().zip(encoded.iter()) {
+            writer.write(shard).await.expect("bitrot write should succeed");
+        }
+        let mut shard_bufs: Vec<Vec<u8>> = shard_writers
+            .into_iter()
+            .map(|writer| writer.into_inner().into_inner())
+            .collect();
+        shard_bufs[DATA_SHARDS][hash_size] ^= 0x80;
+
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, shard_size, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(shard_bufs[1].clone())),
+                shard_size,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(shard_bufs[2].clone())),
+                shard_size,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(shard_bufs[3].clone())),
+                shard_size,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let mut output = Vec::new();
+        let (written, err) = tokio::time::timeout(Duration::from_millis(800), async {
+            erasure.decode(&mut output, readers, 0, data.len(), data.len()).await
+        })
+        .await
+        .expect("corrupt extra source should be rejected before exact-quorum fallback emits");
 
         assert!(err.is_none(), "unexpected decode error: {err:?}");
         assert_eq!(written, data.len());
