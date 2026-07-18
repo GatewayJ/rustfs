@@ -244,6 +244,39 @@ impl LockClient for GrpcLockClient {
         Ok(resp.success)
     }
 
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        let mut client = self.get_client().await?;
+        let req = Request::new(BatchGenerallyLockRequest {
+            args: lock_ids
+                .iter()
+                .map(|lock_id| {
+                    serde_json::to_string(lock_id).map_err(|e| LockError::internal(format!("Failed to serialize lock ID: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
+        let results = client
+            .refresh_batch(req)
+            .await
+            .map_err(|e| LockError::internal(e.to_string()))?
+            .into_inner()
+            .results;
+
+        if results.len() != lock_ids.len() {
+            return Err(LockError::internal(format!(
+                "batch refresh returned {} results for {} requests",
+                results.len(),
+                lock_ids.len()
+            )));
+        }
+        results
+            .into_iter()
+            .map(|result| match result.error_info {
+                Some(error) => Err(LockError::internal(error)),
+                None => Ok(result.success),
+            })
+            .collect()
+    }
+
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         info!("grpc force_release for {}", lock_id);
         let force_request = Self::create_unlock_request(lock_id);

@@ -274,10 +274,11 @@ pub mod disk {
     pub use crate::disk::local::ScanGuard;
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        new_disk, validate_batch_read_version_item_count,
+        CheckPartsResp, DecodedDeleteOptions, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+        DiskStore, FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, OldCurrentSize, RUSTFS_META_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, TRANSACTION_RPC_VERSION,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, decode_delete_options_payload, decode_rename_data_payload, new_disk,
+        validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;

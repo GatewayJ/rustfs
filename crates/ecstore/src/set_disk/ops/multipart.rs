@@ -1433,14 +1433,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // The trailing `_` drops the rename_data old-size backfill
         // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
         // `get_object_info` lookup, so the backfill has no consumer here yet.
+        let parts_metadatas: Arc<[FileInfo]> = parts_metadatas.into();
         let (online_disks, convergence, op_old_dir, cleanup_disks, _) = Self::rename_data(
             &shuffle_disks,
-            RUSTFS_META_MULTIPART_BUCKET,
-            &upload_id_path,
-            &parts_metadatas,
-            bucket,
-            object,
+            (RUSTFS_META_MULTIPART_BUCKET, &upload_id_path),
+            Arc::clone(&parts_metadatas),
+            (bucket, object),
             write_quorum,
+            object_lock_guard.take(),
         )
         .await?;
 

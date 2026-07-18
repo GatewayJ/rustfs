@@ -15,9 +15,9 @@
 pub mod local;
 // pub mod remote;
 
-use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
+use crate::{CommitFenceGuard, LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all};
 use std::sync::Arc;
 
 /// Lock client trait
@@ -48,11 +48,27 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Refresh lock
     async fn refresh(&self, lock_id: &LockId) -> Result<bool>;
 
+    /// Refresh multiple locks. Remote clients override this with one batch RPC;
+    /// older implementations retain a bounded unary fallback.
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        futures::stream::iter(lock_ids.iter().cloned())
+            .map(|lock_id| async move { self.refresh(&lock_id).await })
+            .buffered(crate::types::LOCK_BATCH_FALLBACK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
     /// Force release lock
     async fn force_release(&self, lock_id: &LockId) -> Result<bool>;
 
     /// Check lock status
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>>;
+
+    async fn acquire_commit_fence(&self, _lock_id: &LockId) -> Result<Option<CommitFenceGuard>> {
+        Ok(None)
+    }
 
     /// Get statistics
     async fn get_stats(&self) -> Result<LockStats>;

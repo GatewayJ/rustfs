@@ -631,6 +631,22 @@ impl SetDisks {
                                     );
                                 } else {
                                     rename_successes += 1;
+                                    if let Some(old_dir) = rename_result.as_ref().ok().and_then(|response| response.old_data_dir)
+                                        && Some(old_dir) != parts_metadata[index].data_dir
+                                    {
+                                        let cleanup_path = format!("{object}/{old_dir}");
+                                        if let Err(err) = disk.delete_paths(bucket, &[cleanup_path]).await {
+                                            warn!(
+                                                component = LOG_COMPONENT_ECSTORE,
+                                                subsystem = LOG_SUBSYSTEM_HEAL,
+                                                bucket,
+                                                object,
+                                                old_dir = %old_dir,
+                                                error = %err,
+                                                "Heal rollback cleanup failed"
+                                            );
+                                        }
+                                    }
                                     if parts_metadata[index].is_remote() {
                                         let rm_data_dir =
                                             parts_metadata[index].data_dir.expect("operation should succeed").to_string();

@@ -1854,7 +1854,15 @@ pub(in crate::set_disk) fn metadata_early_stop_permitted(
     caller_allows_early_stop && observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions)
 }
 
+fn all_transaction_protocols_supported(versions: impl IntoIterator<Item = u8>) -> bool {
+    versions.into_iter().all(|version| version == disk::TRANSACTION_RPC_VERSION)
+}
+
 impl SetDisks {
+    pub(in crate::set_disk) fn transactions_supported(disks: &[Option<DiskStore>]) -> bool {
+        all_transaction_protocols_supported(disks.iter().flatten().map(|disk| disk.mutation_protocol_version()))
+    }
+
     pub(in crate::set_disk) async fn read_parts(
         disks: &[Option<DiskStore>],
         bucket: &str,
@@ -2591,16 +2599,15 @@ impl SetDisks {
         data_count
     }
 
-    #[tracing::instrument(level = "debug", skip(disks, file_infos))]
+    #[tracing::instrument(level = "trace", skip_all)]
     #[allow(clippy::type_complexity)]
     pub(in crate::set_disk) async fn rename_data(
         disks: &[Option<DiskStore>],
-        src_bucket: &str,
-        src_object: &str,
-        file_infos: &[FileInfo],
-        dst_bucket: &str,
-        dst_object: &str,
+        src: (&str, &str),
+        file_infos: Arc<[FileInfo]>,
+        dst: (&str, &str),
         write_quorum: usize,
+        object_lock_guard: Option<ObjectLockDiagGuard>,
     ) -> disk::error::Result<(
         Vec<Option<DiskStore>>,
         RenameConvergence,
@@ -2608,14 +2615,64 @@ impl SetDisks {
         Vec<Option<DiskStore>>,
         Option<OldCurrentSize>,
     )> {
+        let disks = disks.to_vec();
+        let (src_bucket, src_object) = src;
+        let src_bucket = src_bucket.to_string();
+        let src_object = src_object.to_string();
+        let (dst_bucket, dst_object) = dst;
+        let dst_bucket = dst_bucket.to_string();
+        let dst_object = dst_object.to_string();
+        cancellation_shield(async move {
+            // Keep the namespace guard through forward and compensation terminal states.
+            Self::rename_data_inner(
+                &disks,
+                (src_bucket, src_object),
+                &file_infos,
+                (dst_bucket, dst_object),
+                write_quorum,
+                object_lock_guard.as_ref(),
+            )
+            .await
+        })
+        .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn rename_data_inner(
+        disks: &[Option<DiskStore>],
+        src: (String, String),
+        file_infos: &[FileInfo],
+        dst: (String, String),
+        write_quorum: usize,
+        object_lock_guard: Option<&ObjectLockDiagGuard>,
+    ) -> disk::error::Result<(
+        Vec<Option<DiskStore>>,
+        RenameConvergence,
+        Option<Uuid>,
+        Vec<Option<DiskStore>>,
+        Option<OldCurrentSize>,
+    )> {
+        if disks.len() != file_infos.len() {
+            return Err(DiskError::Unexpected);
+        }
+        let (src_bucket, src_object) = src;
+        let (dst_bucket, dst_object) = dst;
+
+        let transactional = Self::transactions_supported(disks);
+        let rollback_token = Uuid::new_v4();
+        let commit_lock = if transactional {
+            object_lock_guard.map(ObjectLockDiagGuard::commit_lock).transpose()?.flatten()
+        } else {
+            None
+        };
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
 
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
+        let src_bucket = Arc::new(src_bucket);
+        let src_object = Arc::new(src_object);
+        let dst_bucket = Arc::new(dst_bucket);
+        let dst_object = Arc::new(dst_object);
 
         for (i, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
             let mut file_info = file_info.clone();
@@ -2624,7 +2681,7 @@ impl SetDisks {
             let src_object = src_object.clone();
             let dst_object = dst_object.clone();
             let dst_bucket = dst_bucket.clone();
-
+            let commit_lock = commit_lock.clone();
             futures.push(tokio::spawn(async move {
                 // Test-only introspection guard: counts this task as in-flight for
                 // the whole body. Compiles to `()` in production (no behavior).
@@ -2643,12 +2700,27 @@ impl SetDisks {
                 // A no-op immediately-ready future in production.
                 Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                if let Some(disk) = disk {
-                    disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                let result = if let Some(disk) = disk {
+                    if transactional {
+                        disk.rename_data_with_rollback_fenced(
+                            (&src_bucket, &src_object),
+                            file_info,
+                            (&dst_bucket, &dst_object),
+                            rollback_token,
+                            commit_lock,
+                        )
                         .await
+                    } else {
+                        disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                            .await
+                    }
                 } else {
                     Err(DiskError::DiskNotFound)
-                }
+                };
+
+                // A join failure after a disk call is an ambiguous commit.
+                Self::rename_fanout_completion_fault(&dst_object, i);
+                result
             }));
         }
 
@@ -2658,19 +2730,36 @@ impl SetDisks {
 
         let results = join_all(futures).await;
 
-        for (idx, result) in results.iter().enumerate() {
-            match result.as_ref().map_err(|_| DiskError::Unexpected)? {
-                Ok(res) => {
+        let mut task_join_failed = false;
+        for (idx, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(Ok(res)) => {
                     data_dirs[idx] = res.old_data_dir;
-                    disk_versions[idx].clone_from(&res.sign);
+                    disk_versions[idx] = res.sign;
                     old_current_sizes[idx] = res.old_current_size;
                     errs.push(None);
                 }
-                Err(e) => {
-                    errs.push(Some(e.clone()));
+                Ok(Err(err)) => {
+                    errs.push(Some(err));
+                }
+                Err(join_err) => {
+                    // Treat post-call task failure as an ambiguous commit.
+                    task_join_failed = true;
+                    errs.push(Some(DiskError::Unexpected));
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        dst_bucket = %dst_bucket,
+                        dst_object = %dst_object,
+                        disk_index = idx,
+                        error = %join_err,
+                        "rename_data task failed with an ambiguous commit outcome"
+                    );
                 }
             }
         }
+
+        // Lease loss makes even a quorum result ambiguous; retain rollback state.
+        let lock_lost = object_lock_guard.is_some_and(ObjectLockDiagGuard::is_lock_lost);
 
         if issue3031_diag_enabled() {
             let success_count = errs.iter().filter(|err| err.is_none()).count();
@@ -2700,32 +2789,48 @@ impl SetDisks {
             );
         }
 
+        let quorum_error = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+        let terminal_error = if lock_lost {
+            Some(DiskError::other("namespace lock quorum was lost during rename_data commit"))
+        } else if task_join_failed {
+            Some(DiskError::Unexpected)
+        } else {
+            quorum_error
+        };
+
         let mut futures = Vec::with_capacity(disks.len());
-        if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            for (i, err) in errs.iter().enumerate() {
-                if err.is_some() {
+        if let Some(ret_err) = terminal_error {
+            let rollback_commit_locks = Arc::new(
+                commit_lock
+                    .map(|lock_id| std::collections::BTreeMap::from([(dst_object.as_ref().clone(), lock_id)]))
+                    .unwrap_or_default(),
+            );
+            for (i, disk) in disks.iter().enumerate() {
+                if !transactional && errs[i].is_some() {
                     continue;
                 }
-
-                if let Some(disk) = disks[i].as_ref() {
+                if let Some(disk) = disk.as_ref() {
                     let fi = file_infos[i].clone();
-                    let old_data_dir = data_dirs[i];
                     let disk = disk.clone();
                     let dst_bucket = dst_bucket.clone();
                     let dst_object = dst_object.clone();
+                    let old_data_dir = data_dirs[i];
+                    let rollback_commit_locks = Arc::clone(&rollback_commit_locks);
                     futures.push(tokio::spawn(async move {
-                        disk.delete_version(
-                            &dst_bucket,
-                            &dst_object,
-                            fi,
-                            false,
-                            DeleteOptions {
-                                undo_write: true,
-                                old_data_dir,
-                                ..Default::default()
-                            },
-                        )
-                        .await
+                        #[allow(clippy::let_unit_value)]
+                        let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+                        Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::ROLLBACK).await;
+                        let options = DeleteOptions {
+                            undo_write: true,
+                            old_data_dir: if transactional { Some(rollback_token) } else { old_data_dir },
+                            ..Default::default()
+                        };
+                        if transactional {
+                            disk.delete_version_transaction(&dst_bucket, &dst_object, fi, false, options, rollback_commit_locks)
+                                .await
+                        } else {
+                            disk.delete_version(&dst_bucket, &dst_object, fi, false, options).await
+                        }
                     }));
                 }
             }
@@ -2761,8 +2866,40 @@ impl SetDisks {
                     undo_error_count,
                     "rename_data quorum rollback reported errors"
                 );
+                return Err(DiskError::other(format!(
+                    "rename transaction recovery remains pending on {undo_error_count} disks: {ret_err}"
+                )));
             }
             return Err(ret_err);
+        }
+
+        if transactional {
+            let cleanup_paths = Arc::new(vec![format!("{dst_object}/{rollback_token}")]);
+            let cleanup_futures: Vec<_> = disks
+                .iter()
+                .enumerate()
+                .filter_map(|(disk_index, disk)| {
+                    disk.as_ref().map(|disk| {
+                        let disk = disk.clone();
+                        let cleanup_paths = Arc::clone(&cleanup_paths);
+                        let dst_bucket = Arc::clone(&dst_bucket);
+                        let dst_object = Arc::clone(&dst_object);
+                        async move {
+                            #[allow(clippy::let_unit_value)]
+                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+                            Self::rename_fanout_barrier(&dst_object, disk_index, rename_fanout_barrier_phase::CLEANUP).await;
+                            disk.delete_paths(&dst_bucket, cleanup_paths.as_slice()).await
+                        }
+                    })
+                })
+                .collect();
+            drop(tokio::spawn(async move {
+                let cleanup_results = join_all(cleanup_futures).await;
+                let cleanup_error_count = cleanup_results.iter().filter(|result| result.is_err()).count();
+                if cleanup_error_count > 0 {
+                    warn!(bucket = %dst_bucket, cleanup_error_count, "rename transaction cleanup reported errors");
+                }
+            }));
         }
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
@@ -2993,14 +3130,6 @@ impl SetDisks {
     #[inline(always)]
     fn record_read_version_call(_object: &str, _disk_index: usize) {}
 
-    /// Test-only awaitable pause point for the rename/commit fan-out (backlog#1325,
-    /// serving the barrier-style acceptances of #1312 / #1319 / #1313). `phase` is
-    /// [`rename_fanout_barrier::PHASE_RENAME`] or `PHASE_CLEANUP`. When a test has
-    /// armed a barrier for `object` at this `(disk_index, phase)`, the spawned
-    /// fan-out task blocks here until the test releases it, so the test can await
-    /// the pause point and then introspect in-flight background disk work. In
-    /// production this awaits an immediately-ready no-op future — no yield, no
-    /// registry access, no behavior change.
     #[cfg(test)]
     #[inline]
     async fn rename_fanout_barrier(object: &str, disk_index: usize, phase: &'static str) {
@@ -3011,6 +3140,16 @@ impl SetDisks {
     #[inline(always)]
     #[allow(clippy::unused_async)]
     async fn rename_fanout_barrier(_object: &str, _disk_index: usize, _phase: &'static str) {}
+
+    #[cfg(test)]
+    #[inline]
+    fn rename_fanout_completion_fault(object: &str, disk_index: usize) {
+        rename_fanout_barrier::panic_after_rename_if_armed(object, disk_index);
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn rename_fanout_completion_fault(_object: &str, _disk_index: usize) {}
 
     /// Test-only RAII counter for one in-flight rename/commit fan-out task
     /// (backlog#1325). Held for the whole spawned task body so a test observing
@@ -4130,44 +4269,12 @@ pub(in crate::set_disk) mod disk_call_counters {
 pub(in crate::set_disk) mod rename_fanout_barrier_phase {
     /// The per-disk `rename_data` phase of the write-commit fan-out.
     pub const RENAME: &str = "rename";
+    /// Compensation after an ambiguous or sub-quorum rename outcome.
+    pub const ROLLBACK: &str = "rollback";
     /// The per-disk old-data-dir cleanup phase of the commit fan-out.
     pub const CLEANUP: &str = "cleanup";
 }
 
-/// Test-only awaitable pause barrier + background-task introspection for the
-/// rename/commit fan-out (backlog#1325, the second facility block after the
-/// per-disk call counters). Serves the barrier-style white-box acceptances of
-/// #1312 (commit fencing: "abort at the first-disk rename barrier, assert the
-/// coordinator still holds the lock, assert no background disk write remains
-/// after release"), #1319, and #1313.
-///
-/// Two independent, object-keyed mechanisms share one process-global registry:
-///
-/// 1. **Awaitable pause barrier.** A test [`arm`]s a barrier for `(object,
-///    disk_index, phase)`. The matching spawned fan-out task blocks at its
-///    [`checkpoint`] until the test releases it. The test awaits the pause via
-///    [`BarrierHandle::wait_until_paused`] (a deterministic `Notify` handshake —
-///    no sleeps) and resumes it via [`BarrierHandle::release`]. At most one
-///    barrier is armed per object at a time, matching the single-scope style of
-///    `disk_call_counters`.
-///
-/// 2. **Background-task introspection.** A test [`observe_tasks`] for `object`;
-///    each instrumented fan-out task then holds a [`TaskGuard`] for its whole
-///    body, so [`TaskTrackerScope::running`] reports how many rename/cleanup
-///    background disk tasks are still in flight. This is the concrete "is there
-///    still a background disk write?" signal #1312 asserts after a lock release.
-///
-/// Both are keyed by object and only accumulate for armed/observed objects, so
-/// concurrent tests using distinct object names stay fully isolated. The whole
-/// module is `#[cfg(test)]` and never compiles into production; the fan-out call
-/// sites reach it only through the `#[cfg(not(test))]` no-op seams on `SetDisks`.
-///
-/// Scope of this block (white-box, in-process only): coordinator lock-holding is
-/// asserted by the test at the store/coordinator layer via the guard it already
-/// holds — `io_primitives` has no handle to that namespace lock, and fabricating
-/// a lock-state registry here would be a look-alike rather than the real lock.
-/// Cross-process/black-box fault injection (toxiproxy, blackhole peers, 2-pool)
-/// is a later cluster-harness block, not this one.
 #[cfg(test)]
 pub(in crate::set_disk) mod rename_fanout_barrier {
     use std::collections::HashMap;
@@ -4175,7 +4282,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
     use std::sync::{Arc, Mutex, OnceLock};
     use tokio::sync::Notify;
 
-    pub use super::rename_fanout_barrier_phase::{CLEANUP as PHASE_CLEANUP, RENAME as PHASE_RENAME};
+    pub use super::rename_fanout_barrier_phase::{CLEANUP as PHASE_CLEANUP, RENAME as PHASE_RENAME, ROLLBACK as PHASE_ROLLBACK};
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {
@@ -4187,14 +4294,15 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
         release: Arc<Notify>,
         /// Set once the target task is parked at the checkpoint.
         paused: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
     }
 
     #[derive(Default)]
     struct Registry {
-        /// object -> armed barrier (at most one per object).
-        armed: HashMap<String, Armed>,
+        armed: HashMap<(String, &'static str), Armed>,
         /// object -> live in-flight fan-out task count, only for observed objects.
         observed: HashMap<String, Arc<AtomicUsize>>,
+        panic_after_rename: HashMap<String, usize>,
     }
 
     fn registry() -> &'static Mutex<Registry> {
@@ -4206,15 +4314,49 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
         registry().lock().expect("rename fan-out barrier registry poisoned")
     }
 
+    #[must_use]
+    pub struct PanicAfterRenameGuard {
+        object: String,
+    }
+
+    pub fn panic_after_rename(object: &str, disk_index: usize) -> PanicAfterRenameGuard {
+        lock().panic_after_rename.insert(object.to_string(), disk_index);
+        PanicAfterRenameGuard {
+            object: object.to_string(),
+        }
+    }
+
+    impl Drop for PanicAfterRenameGuard {
+        fn drop(&mut self) {
+            lock().panic_after_rename.remove(&self.object);
+        }
+    }
+
+    pub(in crate::set_disk) fn panic_after_rename_if_armed(object: &str, disk_index: usize) {
+        let armed = {
+            let mut registry = lock();
+            registry
+                .panic_after_rename
+                .get(object)
+                .copied()
+                .filter(|armed_index| *armed_index == disk_index)
+                .and_then(|_| registry.panic_after_rename.remove(object))
+                .is_some()
+        };
+        assert!(!armed, "injected panic after rename commit");
+    }
+
     /// RAII handle for one armed barrier. Dropping it disarms the barrier and
     /// releases any still-parked task, so a panicking or forgetful test can never
     /// leave a spawned fan-out task wedged.
     #[must_use]
     pub struct BarrierHandle {
         object: String,
+        phase: &'static str,
         arrived: Arc<Notify>,
         release: Arc<Notify>,
         paused: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
     }
 
     /// Arm a barrier: the fan-out task for `object` at `(disk_index, phase)` will
@@ -4223,21 +4365,25 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
         let arrived = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let paused = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
         lock().armed.insert(
-            object.to_string(),
+            (object.to_string(), phase),
             Armed {
                 disk_index,
                 phase,
                 arrived: arrived.clone(),
                 release: release.clone(),
                 paused: paused.clone(),
+                released: released.clone(),
             },
         );
         BarrierHandle {
             object: object.to_string(),
+            phase,
             arrived,
             release,
             paused,
+            released,
         }
     }
 
@@ -4259,7 +4405,8 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
 
         /// Release the parked task so the fan-out can proceed.
         pub fn release(&self) {
-            self.release.notify_one();
+            self.released.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
         }
     }
 
@@ -4267,8 +4414,9 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
         fn drop(&mut self) {
             // Unblock any task still parked at the checkpoint before disarming, so
             // a dropped handle can never wedge a spawned fan-out task.
-            self.release.notify_one();
-            lock().armed.remove(&self.object);
+            self.released.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
+            lock().armed.remove(&(self.object.clone(), self.phase));
         }
     }
 
@@ -4279,17 +4427,22 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
     pub(in crate::set_disk) async fn checkpoint(object: &str, disk_index: usize, phase: &'static str) {
         let hooks = {
             let reg = lock();
-            match reg.armed.get(object) {
+            match reg.armed.get(&(object.to_string(), phase)) {
                 Some(a) if a.disk_index == disk_index && a.phase == phase => {
-                    Some((a.arrived.clone(), a.release.clone(), a.paused.clone()))
+                    Some((a.arrived.clone(), a.release.clone(), a.paused.clone(), a.released.clone()))
                 }
                 _ => None,
             }
         };
-        if let Some((arrived, release, paused)) = hooks {
+        if let Some((arrived, release, paused, released)) = hooks {
+            let release_notification = release.notified();
+            tokio::pin!(release_notification);
+            release_notification.as_mut().enable();
             paused.store(true, Ordering::SeqCst);
             arrived.notify_one();
-            release.notified().await;
+            if !released.load(Ordering::SeqCst) {
+                release_notification.await;
+            }
         }
     }
 
@@ -4363,6 +4516,26 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn transaction_protocol_requires_explicit_support_from_every_online_disk() {
+        assert!(all_transaction_protocols_supported([
+            disk::TRANSACTION_RPC_VERSION,
+            disk::TRANSACTION_RPC_VERSION,
+        ]));
+        assert!(!all_transaction_protocols_supported([
+            disk::TRANSACTION_RPC_VERSION,
+            disk::MUTATION_PROTOCOL_UNKNOWN,
+        ]));
+        assert!(!all_transaction_protocols_supported([
+            disk::TRANSACTION_RPC_VERSION,
+            disk::MUTATION_PROTOCOL_LEGACY,
+        ]));
+        assert!(!all_transaction_protocols_supported([
+            disk::TRANSACTION_RPC_VERSION,
+            disk::TRANSACTION_RPC_VERSION + 1,
+        ]));
+    }
 
     fn metadata_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);
@@ -4619,7 +4792,7 @@ mod tests {
 
         // Run the real rename fan-out concurrently with the control flow so we can
         // introspect while it is parked at the first disk's rename checkpoint.
-        let rename_fut = SetDisks::rename_data(&disks, bucket, object, &file_infos, bucket, object, DISKS - 1);
+        let rename_fut = SetDisks::rename_data(&disks, (bucket, object), file_infos.into(), (bucket, object), DISKS - 1, None);
         let control_fut = async {
             tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
                 .await
@@ -4632,6 +4805,111 @@ mod tests {
 
         // The fan-out has fully joined -> every task guard has dropped.
         assert_eq!(tracker.running(), 0, "no background rename task may remain once the fan-out has drained");
+
+        drop(dirs);
+    }
+
+    #[tokio::test]
+    async fn rename_lock_loss_drains_rollback_before_releasing_guard() {
+        const DISKS: usize = 4;
+        let bucket = "rename-lock-loss-bucket";
+        let object = "rename-lock-loss-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let set = io_primitives_test_set(disks.clone(), DISKS / 2).await;
+        let file_infos = rename_barrier_fileinfos(object, DISKS);
+        let guard = set
+            .acquire_write_lock_diag("rename_lock_loss_test", bucket, object)
+            .await
+            .expect("test namespace lock should be acquired");
+        let lock_lost = guard.lock_lost_signal_for_test();
+        let guard_dropped = guard.drop_signal_for_test();
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        let forward_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let rollback_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_ROLLBACK);
+
+        let rename_fut =
+            SetDisks::rename_data(&disks, (bucket, object), file_infos.into(), (bucket, object), DISKS - 1, Some(guard));
+        let control_fut = async {
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, forward_barrier.wait_until_paused())
+                .await
+                .expect("rename fan-out must reach the armed forward barrier");
+            lock_lost.store(true, std::sync::atomic::Ordering::SeqCst);
+            forward_barrier.release();
+
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, rollback_barrier.wait_until_paused())
+                .await
+                .expect("rename compensation must reach the armed rollback barrier");
+            assert!(tracker.running() >= 1, "rollback RPC must still be tracked while paused");
+            assert!(
+                !guard_dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "namespace guard must remain alive while rollback is in flight"
+            );
+            rollback_barrier.release();
+        };
+        let (result, ()) = tokio::join!(rename_fut, control_fut);
+
+        let err = result.expect_err("lock loss during forward must prevent a successful ACK");
+        assert!(
+            err.to_string().contains("namespace lock quorum was lost"),
+            "lock-loss failure should remain distinguishable: {err}"
+        );
+        assert!(
+            guard_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "namespace guard should release after rollback reaches a terminal result"
+        );
+        assert_eq!(tracker.running(), 0, "no rollback RPC may outlive rename_data");
+
+        drop(dirs);
+    }
+
+    #[tokio::test]
+    async fn rename_success_releases_guard_before_transaction_payload_gc() {
+        const DISKS: usize = 4;
+        let bucket = "rename-cleanup-guard-bucket";
+        let object = "rename-cleanup-guard-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let set = io_primitives_test_set(disks.clone(), DISKS / 2).await;
+        let mut file_infos = rename_barrier_fileinfos(object, DISKS);
+        for file_info in &mut file_infos {
+            file_info.volume = bucket.to_string();
+            file_info.data = Some(Bytes::from_static(b"new"));
+            file_info.size = 3;
+            file_info.erasure.index = 0;
+            file_info.mod_time = Some(time::OffsetDateTime::now_utc());
+        }
+        let guard = set
+            .acquire_write_lock_diag("rename_cleanup_guard_test", bucket, object)
+            .await
+            .expect("test namespace lock should be acquired");
+        let guard_dropped = guard.drop_signal_for_test();
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+
+        let rename_fut = SetDisks::rename_data(
+            &disks,
+            (bucket, "staged-inline-object"),
+            file_infos.into(),
+            (bucket, object),
+            DISKS - 1,
+            Some(guard),
+        );
+        rename_fut.await.expect("inline rename should commit successfully");
+        tokio::time::timeout(BARRIER_PAUSE_GUARD, cleanup_barrier.wait_until_paused())
+            .await
+            .expect("successful rename must schedule transaction payload cleanup");
+        assert!(tracker.running() >= 1, "cleanup operation must still be tracked while paused");
+        assert!(
+            guard_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "payload GC must not extend the namespace-lock critical path"
+        );
+        cleanup_barrier.release();
+        tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+            while tracker.running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transaction payload cleanup should finish after release");
 
         drop(dirs);
     }
@@ -4697,7 +4975,7 @@ mod tests {
         // barrier ignored the object key) would surface as a timeout.
         let _ = tokio::time::timeout(
             BARRIER_PAUSE_GUARD,
-            SetDisks::rename_data(&disks, bucket, other_object, &file_infos, bucket, other_object, DISKS - 1),
+            SetDisks::rename_data(&disks, (bucket, other_object), file_infos.into(), (bucket, other_object), DISKS - 1, None),
         )
         .await
         .expect("fan-out for an unarmed object must not pause");

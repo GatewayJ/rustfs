@@ -13,10 +13,77 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
+pub const LOCK_BATCH_FALLBACK_CONCURRENCY: usize = 32;
+
 use crate::ObjectKey;
+
+#[derive(Debug, Default)]
+pub(crate) struct CommitFenceState {
+    active: AtomicUsize,
+    closing: AtomicBool,
+    notify: Notify,
+}
+
+impl CommitFenceState {
+    pub(crate) fn try_enter(self: &Arc<Self>) -> Option<CommitFenceGuard> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.leave();
+            return None;
+        }
+        Some(CommitFenceGuard { state: Arc::clone(self) })
+    }
+
+    pub(crate) fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn leave(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+/// Pins an already validated exclusive namespace lease until the storage
+/// commit point has completed. Dropping the guard releases the pin.
+#[derive(Debug)]
+pub struct CommitFenceGuard {
+    state: Arc<CommitFenceState>,
+}
+
+impl Drop for CommitFenceGuard {
+    fn drop(&mut self) {
+        self.state.leave();
+    }
+}
 
 /// Lock type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

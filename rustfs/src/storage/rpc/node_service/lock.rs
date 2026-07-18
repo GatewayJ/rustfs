@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use super::NodeService;
-use rustfs_lock::LockRequest;
+use futures::{StreamExt, future::join_all};
+use rustfs_lock::{LockRequest, types::LOCK_BATCH_FALLBACK_CONCURRENCY};
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
 
@@ -31,6 +32,13 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
         error_info: Some(error.into()),
         lock_info: None,
     }
+}
+
+fn finish_batch_results(results: Vec<Option<GenerallyLockResult>>) -> Vec<GenerallyLockResult> {
+    results
+        .into_iter()
+        .map(|result| result.unwrap_or_else(|| lock_result_from_error("request was not processed")))
+        .collect()
 }
 
 /// Delegate a refresh RPC to the node's lock backend (`LocalClient::refresh`).
@@ -80,6 +88,14 @@ fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> Gen
     }
 }
 
+fn lock_result_from_refresh(success: bool) -> GenerallyLockResult {
+    GenerallyLockResult {
+        success,
+        error_info: None,
+        lock_info: None,
+    }
+}
+
 impl NodeService {
     pub(super) async fn handle_refresh(
         &self,
@@ -99,6 +115,56 @@ impl NodeService {
 
         let lock_client = self.get_lock_client()?;
         Ok(Response::new(refresh_lock(&lock_client, &args).await))
+    }
+
+    pub(super) async fn handle_refresh_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![None; request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<rustfs_lock::LockId>(arg) {
+                Ok(lock_id) => {
+                    lock_ids.push(lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => results[idx] = Some(lock_result_from_error(format!("can not decode args, err: {err}"))),
+            }
+        }
+
+        if !lock_ids.is_empty() {
+            let lock_client = self.get_lock_client()?;
+            match lock_client.refresh_locks_batch(&lock_ids).await {
+                Ok(batch_results) if batch_results.len() == valid_indices.len() => {
+                    for (request_idx, success) in valid_indices.iter().zip(batch_results) {
+                        results[*request_idx] = Some(lock_result_from_refresh(success));
+                    }
+                }
+                Ok(batch_results) => {
+                    let error = format!(
+                        "batch refresh backend returned {} results for {} requests",
+                        batch_results.len(),
+                        valid_indices.len()
+                    );
+                    for request_idx in valid_indices {
+                        results[request_idx] = Some(lock_result_from_error(error.clone()));
+                    }
+                }
+                Err(err) => {
+                    for request_idx in valid_indices {
+                        results[request_idx] = Some(lock_result_from_error(format!("can not batch refresh, err: {err}")));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse {
+            results: finish_batch_results(results),
+        }))
     }
 
     pub(super) async fn handle_force_un_lock(
@@ -219,7 +285,7 @@ impl NodeService {
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut results = vec![None; request.args.len()];
         let mut valid_requests = Vec::with_capacity(request.args.len());
         let mut valid_indices = Vec::with_capacity(request.args.len());
 
@@ -230,7 +296,7 @@ impl NodeService {
                     valid_indices.push(idx);
                 }
                 Err(err) => {
-                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                    results[idx] = Some(lock_result_from_error(format!("can not decode args, err: {err}")));
                 }
             }
         }
@@ -238,22 +304,36 @@ impl NodeService {
         if !valid_requests.is_empty() {
             let lock_client = self.get_lock_client()?;
             match lock_client.acquire_locks_batch(&valid_requests).await {
+                Ok(batch_results) if batch_results.len() == valid_indices.len() => {
+                    for (request_idx, response) in valid_indices.iter().zip(batch_results) {
+                        results[*request_idx] = Some(lock_result_from_response(response));
+                    }
+                }
                 Ok(batch_results) => {
-                    for (result_idx, response) in batch_results.into_iter().enumerate() {
-                        if let Some(request_idx) = valid_indices.get(result_idx) {
-                            results[*request_idx] = lock_result_from_response(response);
-                        }
+                    let cleanup = join_all(valid_requests.iter().map(|request| lock_client.release(&request.lock_id))).await;
+                    if cleanup.iter().any(Result::is_err) {
+                        tracing::warn!("failed to clean every lock after a batch response cardinality mismatch");
+                    }
+                    let error = format!(
+                        "batch lock backend returned {} results for {} requests",
+                        batch_results.len(),
+                        valid_indices.len()
+                    );
+                    for request_idx in valid_indices {
+                        results[request_idx] = Some(lock_result_from_error(error.clone()));
                     }
                 }
                 Err(err) => {
                     for request_idx in valid_indices {
-                        results[request_idx] = lock_result_from_error(format!("can not batch lock, err: {err}"));
+                        results[request_idx] = Some(lock_result_from_error(format!("can not batch lock, err: {err}")));
                     }
                 }
             }
         }
 
-        Ok(Response::new(BatchGenerallyLockResponse { results }))
+        Ok(Response::new(BatchGenerallyLockResponse {
+            results: finish_batch_results(results),
+        }))
     }
 
     pub(super) async fn handle_un_lock_batch(
@@ -261,7 +341,7 @@ impl NodeService {
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut results = vec![None; request.args.len()];
         let mut lock_ids = Vec::with_capacity(request.args.len());
         let mut valid_indices = Vec::with_capacity(request.args.len());
 
@@ -272,7 +352,7 @@ impl NodeService {
                     valid_indices.push(idx);
                 }
                 Err(err) => {
-                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                    results[idx] = Some(lock_result_from_error(format!("can not decode args, err: {err}")));
                 }
             }
         }
@@ -280,25 +360,41 @@ impl NodeService {
         if !lock_ids.is_empty() {
             let lock_client = self.get_lock_client()?;
             match lock_client.release_locks_batch(&lock_ids).await {
+                Ok(batch_results) if batch_results.len() == valid_indices.len() => {
+                    for ((request_idx, lock_id), success) in valid_indices.iter().zip(&lock_ids).zip(batch_results) {
+                        results[*request_idx] = Some(lock_result_from_release(lock_id, success));
+                    }
+                }
                 Ok(batch_results) => {
-                    for (result_idx, success) in batch_results.into_iter().enumerate() {
-                        if let Some(request_idx) = valid_indices.get(result_idx) {
-                            results[*request_idx] = match lock_ids.get(result_idx) {
-                                Some(lock_id) => lock_result_from_release(lock_id, success),
-                                None => lock_result_from_error(format!("unlock response index out of range: {result_idx}")),
-                            };
-                        }
+                    let fallback = futures::stream::iter(lock_ids.iter().cloned().map(|lock_id| {
+                        let lock_client = std::sync::Arc::clone(&lock_client);
+                        async move { lock_client.release(&lock_id).await }
+                    }))
+                    .buffered(LOCK_BATCH_FALLBACK_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
+                    for ((request_idx, lock_id), result) in valid_indices.iter().zip(&lock_ids).zip(fallback) {
+                        results[*request_idx] = Some(match result {
+                            Ok(success) => lock_result_from_release(lock_id, success),
+                            Err(err) => lock_result_from_error(format!(
+                                "batch unlock backend returned {} results for {} requests; fallback failed: {err}",
+                                batch_results.len(),
+                                valid_indices.len()
+                            )),
+                        });
                     }
                 }
                 Err(err) => {
                     for request_idx in valid_indices {
-                        results[request_idx] = lock_result_from_error(format!("can not batch unlock, err: {err}"));
+                        results[request_idx] = Some(lock_result_from_error(format!("can not batch unlock, err: {err}")));
                     }
                 }
             }
         }
 
-        Ok(Response::new(BatchGenerallyLockResponse { results }))
+        Ok(Response::new(BatchGenerallyLockResponse {
+            results: finish_batch_results(results),
+        }))
     }
 }
 

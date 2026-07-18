@@ -15,7 +15,8 @@
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, TRANSACTION_RPC_VERSION, UpdateMetadataOpts,
+    decode_delete_options_payload, decode_rename_data_payload, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
@@ -26,13 +27,23 @@ use rustfs_io_metrics::internode_metrics::{
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
 /// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
 /// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+
+fn validate_delete_versions_result_count(expected: usize, actual: usize) -> std::result::Result<(), DiskError> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(DiskError::other(format!(
+        "delete versions returned {actual} result(s) for {expected} request(s)"
+    )))
+}
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
@@ -122,6 +133,7 @@ impl NodeService {
                         success: false,
                         disk_info: "".to_string(),
                         error: Some(DiskError::other(format!("decode DiskInfoOptions failed: {err}")).into()),
+                        mutation_protocol_version: 0,
                     }));
                 }
             };
@@ -131,17 +143,20 @@ impl NodeService {
                         success: true,
                         disk_info,
                         error: None,
+                        mutation_protocol_version: u32::from(TRANSACTION_RPC_VERSION),
                     })),
                     Err(err) => Ok(Response::new(DiskInfoResponse {
                         success: false,
                         disk_info: "".to_string(),
                         error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        mutation_protocol_version: 0,
                     })),
                 },
                 Err(err) => Ok(Response::new(DiskInfoResponse {
                     success: false,
                     disk_info: "".to_string(),
                     error: Some(err.into()),
+                    mutation_protocol_version: 0,
                 })),
             }
         } else {
@@ -149,6 +164,7 @@ impl NodeService {
                 success: false,
                 disk_info: "".to_string(),
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
+                mutation_protocol_version: 0,
             }))
         }
     }
@@ -311,6 +327,16 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionsRequest>,
     ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        let payload = match decode_delete_options_payload(&request.get_ref().opts_bin, &request.get_ref().opts) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                }));
+            }
+        };
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let mut versions = Vec::with_capacity(request.versions.len());
@@ -327,20 +353,23 @@ impl NodeService {
                     }
                 };
             }
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
-                Ok(opts) => opts,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionsResponse {
-                        success: false,
-                        errors: Vec::new(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
-                    }));
-                }
-            };
+            let expected_result_count = versions.len();
 
-            let errors = disk
-                .delete_versions(&request.volume, versions, opts)
-                .await
+            let volume = request.volume;
+            let errors = if let Some(commit_locks) = payload.commit_locks {
+                disk.delete_versions_transaction(&volume, versions, payload.options, Arc::new(commit_locks))
+                    .await
+            } else {
+                disk.delete_versions(&volume, versions, payload.options).await
+            };
+            if let Err(err) = validate_delete_versions_result_count(expected_result_count, errors.len()) {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(err.into()),
+                }));
+            }
+            let errors = errors
                 .into_iter()
                 .map(|error| match error {
                     Some(e) => e.to_string(),
@@ -366,6 +395,16 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        let payload = match decode_delete_options_payload(&request.get_ref().opts_bin, &request.get_ref().opts) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: String::new(),
+                    error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                }));
+            }
+        };
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -378,20 +417,24 @@ impl NodeService {
                     }));
                 }
             };
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
-                Ok(opts) => opts,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
-                    }));
-                }
-            };
-            match disk
-                .delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+            let volume = request.volume;
+            let path = request.path;
+            let force_del_marker = request.force_del_marker;
+            let result = if let Some(commit_locks) = payload.commit_locks {
+                disk.delete_version_transaction(
+                    &volume,
+                    &path,
+                    file_info,
+                    force_del_marker,
+                    payload.options,
+                    Arc::new(commit_locks),
+                )
                 .await
-            {
+            } else {
+                disk.delete_version(&volume, &path, file_info, force_del_marker, payload.options)
+                    .await
+            };
+            match result {
                 Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
                     Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
                         success: true,
@@ -773,23 +816,50 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        if request.get_ref().file_info_bin.is_empty() {
+            global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+        }
+        let payload = match decode_rename_data_payload(&request.get_ref().file_info_bin, &request.get_ref().file_info) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Ok(Response::new(RenameDataResponse {
+                    success: false,
+                    rename_data_resp: String::new(),
+                    rename_data_resp_bin: Vec::new().into(),
+                    error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                }));
+            }
+        };
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(RenameDataResponse {
-                        success: false,
-                        rename_data_resp: String::new(),
-                        rename_data_resp_bin: Vec::new().into(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
+            let src_volume = request.src_volume;
+            let src_path = request.src_path;
+            let dst_volume = request.dst_volume;
+            let dst_path = request.dst_path;
+            let result = {
+                if let Some(rollback_token) = payload.rollback_token {
+                    crate::storage::storage_api::rpc_consumer::node_service::StorageDiskRpcExt::rename_data_with_rollback_fenced(
+                        disk.as_ref(),
+                        (&src_volume, &src_path),
+                        payload.file_info,
+                        (&dst_volume, &dst_path),
+                        rollback_token,
+                        payload.commit_lock,
+                    )
+                    .await
+                } else {
+                    crate::storage::storage_api::rpc_consumer::node_service::StorageDiskRpcExt::rename_data(
+                        disk.as_ref(),
+                        &src_volume,
+                        &src_path,
+                        payload.file_info,
+                        &dst_volume,
+                        &dst_path,
+                    )
+                    .await
                 }
             };
-            match disk
-                .rename_data(&request.src_volume, &request.src_path, file_info, &request.dst_volume, &request.dst_path)
-                .await
-            {
+            match result {
                 Ok(rename_data_resp) => {
                     let rename_data_resp_json = compat_response_json(&rename_data_resp);
                     let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
@@ -1176,7 +1246,7 @@ impl NodeService {
 mod tests {
     use super::{
         decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_read_multiple_response_payloads,
+        encode_read_multiple_response_payloads, validate_delete_versions_result_count,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
@@ -1186,6 +1256,14 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn delete_versions_result_count_must_match_request_count() {
+        assert!(validate_delete_versions_result_count(0, 0).is_ok());
+        assert!(validate_delete_versions_result_count(3, 3).is_ok());
+        assert!(validate_delete_versions_result_count(3, 2).is_err());
+        assert!(validate_delete_versions_result_count(3, 4).is_err());
     }
 
     #[test]

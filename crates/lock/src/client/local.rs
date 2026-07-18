@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 use crate::{
-    FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
-    LockResponse, LockStats, LockStatus, LockType, Result,
+    CommitFenceGuard, FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority,
+    LockRequest, LockResponse, LockStats, LockStatus, LockType, Result, types::CommitFenceState,
 };
 
 /// Default shard count for guard storage (must be power of 2)
@@ -40,6 +40,7 @@ pub struct LocalClient {
 #[derive(Debug)]
 struct LocalGuardEntry {
     guard: FastLockGuard,
+    commit_fence: Arc<CommitFenceState>,
     expires_at: SystemTime,
     ttl: Duration,
     /// Owner recorded at acquire time; used only for reclaim diagnostics (#899).
@@ -51,6 +52,7 @@ impl LocalGuardEntry {
         let now = SystemTime::now();
         Self {
             guard,
+            commit_fence: Arc::new(CommitFenceState::default()),
             expires_at: now + ttl,
             ttl,
             owner,
@@ -118,51 +120,70 @@ impl LocalClient {
     }
 
     async fn reclaim_expired_guards_for_resource(&self, resource: &crate::ObjectKey) -> usize {
-        let mut reclaimed = 0usize;
-
+        let mut expired = Vec::new();
         for shard in &self.guard_storage {
-            let expired_entries = {
-                let mut guards = shard.write().await;
-                let mut retained = HashMap::with_capacity(guards.len());
-                let mut expired_entries = Vec::new();
+            let guards = shard.read().await;
+            expired.extend(
+                guards
+                    .iter()
+                    .filter(|(lock_id, entry)| &lock_id.resource == resource && entry.is_expired())
+                    .map(|(lock_id, entry)| (lock_id.clone(), entry.owner.clone(), entry.expires_at, entry.ttl)),
+            );
+        }
 
-                for (lock_id, entry) in std::mem::take(&mut *guards) {
-                    if &lock_id.resource == resource && entry.is_expired() {
-                        expired_entries.push(entry);
-                    } else {
-                        retained.insert(lock_id, entry);
-                    }
-                }
-
-                *guards = retained;
-                expired_entries
-            };
-
-            for mut entry in expired_entries {
+        let mut reclaimed = 0usize;
+        for (lock_id, owner, expires_at, ttl) in expired {
+            if self.remove_guard_after_fences(&lock_id, Some(expires_at)).await.is_some() {
                 // An expired entry whose owner never refreshed it (a dead coordinator, #698) is
                 // reclaimed so a live contender can re-form quorum. With guard heartbeats in place
                 // (#899) a live owner keeps its entry from expiring, so reaching here means the
                 // lease genuinely lapsed. Surface it for observability; the reclaim decision itself
                 // is unchanged.
-                let since_last_refresh = entry
-                    .expires_at
-                    .checked_sub(entry.ttl)
+                let since_last_refresh = expires_at
+                    .checked_sub(ttl)
                     .and_then(|last_refresh| SystemTime::now().duration_since(last_refresh).ok())
-                    .unwrap_or(entry.ttl);
+                    .unwrap_or(ttl);
                 tracing::warn!(
-                    owner = %entry.owner,
+                    owner = %owner,
                     resource = %resource,
-                    ttl_ms = entry.ttl.as_millis() as u64,
+                    ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
                     since_last_refresh_ms = since_last_refresh.as_millis() as u64,
                     "reclaiming expired lock guard whose lease was not refreshed"
                 );
                 rustfs_io_metrics::record_lock_reclaimed();
-                let _ = entry.guard.release();
                 reclaimed = reclaimed.saturating_add(1);
             }
         }
 
         reclaimed
+    }
+
+    async fn remove_guard_after_fences(
+        &self,
+        lock_id: &LockId,
+        expected_expired_at: Option<SystemTime>,
+    ) -> Option<LocalGuardEntry> {
+        let fence = {
+            let guards = self.get_shard(lock_id).write().await;
+            let entry = guards.get(lock_id)?;
+            if let Some(expected_expired_at) = expected_expired_at
+                && (entry.expires_at != expected_expired_at || !entry.is_expired())
+            {
+                return None;
+            }
+            entry.commit_fence.close();
+            Arc::clone(&entry.commit_fence)
+        };
+        fence.wait_until_idle().await;
+        let mut guards = self.get_shard(lock_id).write().await;
+        if guards
+            .get(lock_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.commit_fence, &fence))
+        {
+            guards.remove(lock_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -242,9 +263,7 @@ impl LockClient for LocalClient {
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        let shard = self.get_shard(lock_id);
-        let mut guards = shard.write().await;
-        if let Some(guard) = guards.remove(lock_id) {
+        if let Some(guard) = self.remove_guard_after_fences(lock_id, None).await {
             // Guard automatically releases the lock when dropped
             drop(guard.guard);
             Ok(true)
@@ -258,11 +277,22 @@ impl LockClient for LocalClient {
         let shard = self.get_shard(lock_id);
         let mut guards = shard.write().await;
         if let Some(entry) = guards.get_mut(lock_id) {
+            if entry.commit_fence.is_closing() || entry.is_expired() {
+                return Ok(false);
+            }
             entry.refresh();
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        let mut results = Vec::with_capacity(lock_ids.len());
+        for lock_id in lock_ids {
+            results.push(self.refresh(lock_id).await?);
+        }
+        Ok(results)
     }
 
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
@@ -301,6 +331,17 @@ impl LockClient for LocalClient {
         }
     }
 
+    async fn acquire_commit_fence(&self, lock_id: &LockId) -> Result<Option<CommitFenceGuard>> {
+        let guards = self.get_shard(lock_id).read().await;
+        let Some(entry) = guards.get(lock_id) else {
+            return Ok(None);
+        };
+        if entry.is_expired() || entry.guard.mode() != crate::LockMode::Exclusive {
+            return Ok(None);
+        }
+        Ok(entry.commit_fence.try_enter())
+    }
+
     async fn get_stats(&self) -> Result<LockStats> {
         Ok(LockStats::default())
     }
@@ -315,5 +356,93 @@ impl LockClient for LocalClient {
 
     async fn is_local(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalClient;
+    use crate::{LockClient, LockRequest, LockType, ObjectKey};
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn release_waits_for_active_commit_fence() {
+        let client = Arc::new(LocalClient::new());
+        let request =
+            LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner").with_ttl(Duration::from_secs(30));
+        let lock_id = client
+            .acquire_lock(&request)
+            .await
+            .expect("write lock should be acquired")
+            .lock_info
+            .expect("successful lock should include lock info")
+            .id;
+        let commit_fence = client
+            .acquire_commit_fence(&lock_id)
+            .await
+            .expect("commit fence lookup should succeed")
+            .expect("active exclusive lock should admit a commit fence");
+
+        let release_client = Arc::clone(&client);
+        let release_lock_id = lock_id.clone();
+        let release = tokio::spawn(async move { release_client.release(&release_lock_id).await });
+
+        loop {
+            let probe = client
+                .acquire_commit_fence(&lock_id)
+                .await
+                .expect("commit fence probe should succeed");
+            if probe.is_none() {
+                break;
+            }
+            drop(probe);
+            tokio::task::yield_now().await;
+        }
+        assert!(!release.is_finished(), "lock release must wait for the active storage commit");
+
+        drop(commit_fence);
+        assert!(
+            release
+                .await
+                .expect("release task should not panic")
+                .expect("release should succeed"),
+            "the held lock should be released after the commit fence exits"
+        );
+        assert!(
+            client
+                .acquire_commit_fence(&lock_id)
+                .await
+                .expect("post-release commit fence lookup should succeed")
+                .is_none(),
+            "a released lock must not admit another commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_guard_cannot_be_revived_by_a_late_refresh() {
+        let client = LocalClient::new();
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(10));
+        let lock_id = client
+            .acquire_lock(&request)
+            .await
+            .expect("write lock should be acquired")
+            .lock_info
+            .expect("successful lock should include lock info")
+            .id;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !client.refresh(&lock_id).await.expect("refresh should complete"),
+            "an expired lease must not be revived by a delayed heartbeat"
+        );
+        assert!(
+            client
+                .acquire_commit_fence(&lock_id)
+                .await
+                .expect("commit fence lookup should succeed")
+                .is_none(),
+            "an expired lease must not admit a storage commit"
+        );
+        assert!(client.release(&lock_id).await.expect("release should succeed"));
     }
 }

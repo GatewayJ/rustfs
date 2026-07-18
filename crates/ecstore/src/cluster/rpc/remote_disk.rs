@@ -22,14 +22,14 @@ use crate::cluster::rpc::internode_data_transport::{
 use crate::disk::error::{Error, Result};
 use crate::disk::{
     BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, RENAME_DATA_ENVELOPE_MAGIC, ReadMultipleReq, ReadMultipleResp,
+    ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
-        DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
-        get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
-        get_drive_metadata_timeout, get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
-        get_object_disk_read_timeout,
+        DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, get_drive_active_check_interval,
+        get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout, get_drive_metadata_timeout,
+        get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration, get_object_disk_read_timeout,
     },
+    encode_delete_options_envelope, encode_rename_data_envelope,
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
     validate_batch_read_version_item_count,
@@ -42,6 +42,7 @@ use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
+use rustfs_protos::proto_gen::node_service::Error as RpcError;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
@@ -56,7 +57,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -96,6 +97,46 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+enum RenameDataRpcOutcome {
+    Success(RenameDataResp),
+    TransactionUnsupported,
+}
+
+const RENAME_DATA_LEGACY_JSON_PROBE: &str = "\"rustfs-rename-transaction-v1\"";
+const DELETE_OPTIONS_DECODE_ERROR_PREFIX: &str = "io error decode DeleteOptions failed: ";
+const RENAME_TRANSACTION_UNSUPPORTED: &str = "peer does not support rollback-protected rename transactions";
+const DELETE_TRANSACTION_UNSUPPORTED: &str = "peer does not support rollback-protected delete transactions";
+
+fn is_legacy_rename_envelope_rejection(error: &RpcError) -> bool {
+    let msgpack_rejection = format!(
+        "io error decode FileInfo failed: io error decode FileInfo msgpack failed: invalid type: integer `{RENAME_DATA_ENVELOPE_MAGIC}`, expected a string"
+    );
+    let pre_bin_rejection = format!(
+        "io error decode FileInfo failed: invalid type: string {RENAME_DATA_LEGACY_JSON_PROBE}, expected struct FileInfo"
+    );
+    error.code == DiskError::other("").to_u32()
+        && (error.error_info == msgpack_rejection || error.error_info == pre_bin_rejection)
+}
+
+fn is_delete_options_envelope_rejection(error: &RpcError) -> bool {
+    error.code == DiskError::other("").to_u32() && error.error_info.starts_with(DELETE_OPTIONS_DECODE_ERROR_PREFIX)
+}
+
+fn normalize_delete_versions_errors(errors: Vec<String>, expected_len: usize) -> Vec<Option<Error>> {
+    if errors.len() != expected_len {
+        let error = Error::other(format!(
+            "delete_versions response cardinality mismatch: expected {expected_len}, got {}",
+            errors.len()
+        ));
+        return vec![Some(error); expected_len];
+    }
+
+    errors
+        .into_iter()
+        .map(|error| if error.is_empty() { None } else { Some(Error::other(error)) })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchMetadataRpcMode {
@@ -188,6 +229,7 @@ pub struct RemoteDisk {
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
     data_transport: Arc<dyn InternodeDataTransport>,
+    mutation_protocol_version: Arc<AtomicU8>,
 }
 
 // ── Connection lifecycle (grpc-optimization P3) ──
@@ -315,6 +357,7 @@ impl RemoteDisk {
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
             data_transport,
+            mutation_protocol_version: Arc::new(AtomicU8::new(crate::disk::MUTATION_PROTOCOL_UNKNOWN)),
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -445,10 +488,11 @@ impl RemoteDisk {
         let addr = self.addr.clone();
         let endpoint = self.endpoint.clone();
         let health = Arc::clone(&self.health);
+        let protocol = Arc::clone(&self.mutation_protocol_version);
         let cancel_token = self.cancel_token.clone();
         let span = Self::recovery_monitor_span(&addr, &endpoint);
         super::spawn_background_monitor(span, async move {
-            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+            Self::monitor_remote_disk_recovery(addr, endpoint, health, protocol, cancel_token).await;
         });
     }
 
@@ -488,9 +532,10 @@ impl RemoteDisk {
         let cancel_token = self.cancel_token.clone();
         let addr = self.addr.clone();
         let endpoint = self.endpoint.clone();
+        let protocol = Arc::clone(&self.mutation_protocol_version);
 
         tokio::spawn(async move {
-            Self::monitor_remote_disk_health(addr, endpoint, health, cancel_token).await;
+            Self::monitor_remote_disk_health(addr, endpoint, health, protocol, cancel_token).await;
         });
     }
 
@@ -499,15 +544,15 @@ impl RemoteDisk {
         addr: String,
         endpoint: Endpoint,
         health: Arc<DiskHealthTracker>,
+        mutation_protocol_version: Arc<AtomicU8>,
         cancel_token: CancellationToken,
     ) {
         let mut interval = time::interval(get_drive_active_check_interval());
 
-        // Perform basic connectivity check
-        let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
-        if initial_probe_ok {
-            health.record_operation_success(&endpoint, "connectivity_probe_success");
-        } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
+        if let Ok(protocol_version) = Self::perform_recovery_probe(&addr, &endpoint).await {
+            mutation_protocol_version.store(protocol_version, Ordering::Release);
+            health.record_operation_success(&endpoint, "disk_info_probe_success");
+        } else if health.mark_failure(&endpoint, "disk_info_probe_failed") {
             warn!(
                 event = EVENT_REMOTE_DISK_HEALTH,
                 component = LOG_COMPONENT_ECSTORE,
@@ -523,11 +568,12 @@ impl RemoteDisk {
             let health_clone = Arc::clone(&health);
             let addr_clone = addr.clone();
             let endpoint_clone = endpoint.clone();
+            let protocol_clone = Arc::clone(&mutation_protocol_version);
             let cancel_clone = cancel_token.clone();
             let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
             super::spawn_background_monitor(span, async move {
-                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, protocol_clone, cancel_clone).await;
             });
         }
 
@@ -555,22 +601,10 @@ impl RemoteDisk {
                         continue;
                     }
 
-                    let last_success_nanos = health.last_success.load(Ordering::Relaxed);
-                    let elapsed = Duration::from_nanos(
-                        (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .expect("operation should succeed")
-                            .as_nanos() as i64 - last_success_nanos) as u64
-                    );
-
-                    if elapsed < SKIP_IF_SUCCESS_BEFORE {
-                        continue;
-                    }
-
-                    // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_ok() {
-                        health.record_operation_success(&endpoint, "connectivity_probe_success");
-                    } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
+                    if let Ok(protocol_version) = Self::perform_recovery_probe(&addr, &endpoint).await {
+                        mutation_protocol_version.store(protocol_version, Ordering::Release);
+                        health.record_operation_success(&endpoint, "disk_info_probe_success");
+                    } else if health.mark_failure(&endpoint, "health_probe_failed") {
                         warn!(
                             event = EVENT_REMOTE_DISK_HEALTH,
                             component = LOG_COMPONENT_ECSTORE,
@@ -586,11 +620,12 @@ impl RemoteDisk {
                         let health_clone = Arc::clone(&health);
                         let addr_clone = addr.clone();
                         let endpoint_clone = endpoint.clone();
+                        let protocol_clone = Arc::clone(&mutation_protocol_version);
                         let cancel_clone = cancel_token.clone();
                         let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
                         super::spawn_background_monitor(span, async move {
-                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, protocol_clone, cancel_clone).await;
                         });
                     }
                 }
@@ -603,6 +638,7 @@ impl RemoteDisk {
         addr: String,
         endpoint: Endpoint,
         health: Arc<DiskHealthTracker>,
+        mutation_protocol_version: Arc<AtomicU8>,
         cancel_token: CancellationToken,
     ) {
         let mut interval = time::interval(get_drive_returning_probe_interval());
@@ -631,7 +667,8 @@ impl RemoteDisk {
                     return;
                 }
                 _ = interval.tick() => {
-                    if Self::perform_recovery_probe(&addr, &endpoint).await.is_ok() {
+                    if let Ok(protocol_version) = Self::perform_recovery_probe(&addr, &endpoint).await {
+                        mutation_protocol_version.store(protocol_version, Ordering::Release);
                         let became_online = health.mark_recovery_success(&endpoint, "disk_info_probe_success");
                         debug!(
                             event = EVENT_REMOTE_DISK_HEALTH,
@@ -662,7 +699,7 @@ impl RemoteDisk {
         }
     }
 
-    async fn perform_recovery_probe(addr: &str, endpoint: &Endpoint) -> Result<()> {
+    async fn perform_recovery_probe(addr: &str, endpoint: &Endpoint) -> Result<u8> {
         let mut evict_cached_connection = false;
         let result = match timeout(get_drive_active_check_timeout(), async {
             let opts = serde_json::to_string(&DiskInfoOptions {
@@ -686,11 +723,11 @@ impl RemoteDisk {
             if !response.success {
                 return Err((response.error.unwrap_or_default().into(), false));
             }
-            Ok(())
+            Ok(normalize_mutation_protocol_version(response.mutation_protocol_version))
         })
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(version)) => Ok(version),
             Ok(Err((err, should_evict))) => {
                 evict_cached_connection = should_evict;
                 Err(err)
@@ -806,8 +843,24 @@ impl RemoteDisk {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.execute_with_timeout_for_op_and_health_action_inner(op, operation, timeout_duration, failure_health_action, false)
+            .await
+    }
+
+    async fn execute_with_timeout_for_op_and_health_action_inner<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        failure_health_action: FailureHealthAction,
+        bypass_faulty_short_circuit: bool,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
-        if self.health.is_faulty() {
+        if self.health.is_faulty() && !bypass_faulty_short_circuit {
             debug!(
                 event = EVENT_REMOTE_DISK_HEALTH,
                 component = LOG_COMPONENT_ECSTORE,
@@ -913,6 +966,8 @@ impl RemoteDisk {
     }
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
+        self.mutation_protocol_version
+            .store(crate::disk::MUTATION_PROTOCOL_UNKNOWN, Ordering::Release);
         let previous_state = self.runtime_state();
         let transitioned_to_offline = self.mark_suspect_or_offline(reason);
         let state = self.runtime_state();
@@ -982,6 +1037,10 @@ impl RemoteDisk {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
+        self.get_client_allow_offline().await
+    }
+
+    async fn get_client_allow_offline(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
@@ -1032,10 +1091,36 @@ fn compat_json<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
+fn normalize_mutation_protocol_version(version: u32) -> u8 {
+    if version == u32::from(crate::disk::TRANSACTION_RPC_VERSION) {
+        crate::disk::TRANSACTION_RPC_VERSION
+    } else {
+        crate::disk::MUTATION_PROTOCOL_LEGACY
+    }
+}
+
+fn delete_options_compat_json(opts: &DeleteOptions, transaction: bool) -> Result<String> {
+    if transaction {
+        return Ok(String::new());
+    }
+    // Old peers ignore opts_bin, so transaction-free requests retain JSON.
+    Ok(serde_json::to_string(opts)?)
+}
+
 fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
+}
+
+fn encode_delete_options_msgpack(
+    opts: &DeleteOptions,
+    commit_locks: Option<&std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+) -> Result<Vec<u8>> {
+    if let Some(commit_locks) = commit_locks {
+        return encode_delete_options_envelope(opts, commit_locks);
+    }
+    encode_msgpack_named(opts)
 }
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
@@ -1149,6 +1234,266 @@ fn decode_batch_read_version_response_items(
     Ok(batch_read_version_resps)
 }
 
+impl RemoteDisk {
+    async fn send_rename_data_payload(
+        &self,
+        src: (&str, &str),
+        dst: (&str, &str),
+        file_info: String,
+        file_info_bin: Vec<u8>,
+        detect_legacy_rejection: bool,
+        transaction: bool,
+    ) -> Result<RenameDataRpcOutcome> {
+        let (src_volume, src_path) = src;
+        let (dst_volume, dst_path) = dst;
+        let operation = || async move {
+            let mut client = self.get_client().await?;
+            let request = Request::new(RenameDataRequest {
+                disk: self.endpoint.to_string(),
+                src_volume: src_volume.to_string(),
+                src_path: src_path.to_string(),
+                file_info,
+                dst_volume: dst_volume.to_string(),
+                dst_path: dst_path.to_string(),
+                file_info_bin: file_info_bin.into(),
+            });
+            let response = client.rename_data(request).await?.into_inner();
+            if !response.success {
+                let error = response.error.unwrap_or_default();
+                if detect_legacy_rejection && is_legacy_rename_envelope_rejection(&error) {
+                    return Ok(RenameDataRpcOutcome::TransactionUnsupported);
+                }
+                return Err(error.into());
+            }
+
+            let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
+                &response.rename_data_resp_bin,
+                &response.rename_data_resp,
+                "RenameDataResp",
+            )?;
+            Ok(RenameDataRpcOutcome::Success(rename_data_resp))
+        };
+
+        self.execute_with_timeout_for_op(
+            if transaction {
+                "rename_data_transaction"
+            } else {
+                "rename_data"
+            },
+            operation,
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_version_transaction(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        commit_locks: Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+    ) -> Result<()> {
+        self.delete_version_rpc(volume, path, fi, force_del_marker, opts, Some(commit_locks))
+            .await
+    }
+
+    async fn delete_version_rpc(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        commit_locks: Option<Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>>,
+    ) -> Result<()> {
+        opts.validate_delete_rollback()?;
+        if let Some(commit_locks) = commit_locks.as_deref() {
+            crate::disk::validate_delete_transaction_commit_locks(&opts, commit_locks, volume, [path])?;
+        }
+        let transaction = commit_locks.is_some();
+        let compensation = opts.is_compensation();
+        let operation = || async {
+            let file_info_bin = Bytes::from(encode_msgpack(&fi)?);
+            let file_info = if transaction {
+                String::new()
+            } else {
+                serde_json::to_string(&fi)?
+            };
+            let opts_json = delete_options_compat_json(&opts, transaction)?;
+            let opts_bin = Bytes::from(encode_delete_options_msgpack(&opts, commit_locks.as_deref())?);
+            let mut client = if compensation {
+                self.get_client_allow_offline().await?
+            } else {
+                self.get_client().await?
+            };
+            let response = client
+                .delete_version(Request::new(DeleteVersionRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                    force_del_marker,
+                    opts: opts_json,
+                    file_info_bin,
+                    opts_bin,
+                }))
+                .await?
+                .into_inner();
+            if transaction && response.error.as_ref().is_some_and(is_delete_options_envelope_rejection) {
+                self.mutation_protocol_version
+                    .store(crate::disk::MUTATION_PROTOCOL_LEGACY, Ordering::Release);
+                return Err(Error::other(DELETE_TRANSACTION_UNSUPPORTED));
+            }
+            if !response.success {
+                return Err(response.error.unwrap_or_default().into());
+            }
+            Ok(())
+        };
+        if transaction {
+            self.execute_with_timeout_for_op_and_health_action_inner(
+                if compensation {
+                    "delete_version_compensation"
+                } else {
+                    "delete_version_transaction"
+                },
+                operation,
+                get_max_timeout_duration(),
+                if compensation {
+                    FailureHealthAction::IgnoreFailure
+                } else {
+                    FailureHealthAction::MarkFailure
+                },
+                compensation,
+            )
+            .await
+        } else {
+            self.execute_with_timeout_for_op("delete_version", operation, get_max_timeout_duration())
+                .await
+        }
+    }
+
+    pub(crate) async fn delete_versions_transaction(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        commit_locks: Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+    ) -> Vec<Option<Error>> {
+        self.delete_versions_rpc(volume, versions, opts, Some(commit_locks)).await
+    }
+
+    async fn delete_versions_rpc(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        commit_locks: Option<Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>>,
+    ) -> Vec<Option<Error>> {
+        let expected_len = versions.len();
+        if let Err(err) = opts.validate_delete_rollback() {
+            return vec![Some(err); expected_len];
+        }
+        if let Some(commit_locks) = commit_locks.as_deref()
+            && let Err(err) = crate::disk::validate_delete_transaction_commit_locks(
+                &opts,
+                commit_locks,
+                volume,
+                versions.iter().map(|version| version.name.as_str()),
+            )
+        {
+            return vec![Some(err); expected_len];
+        }
+        let transaction = commit_locks.is_some();
+        let compensation = opts.is_compensation();
+        if self.health.is_faulty() && !compensation {
+            return vec![Some(DiskError::FaultyDisk); expected_len];
+        }
+        let opts_bin = match encode_delete_options_msgpack(&opts, commit_locks.as_deref()) {
+            Ok(value) => value,
+            Err(err) => return vec![Some(Error::other(err.to_string())); expected_len],
+        };
+        let opts_json = match delete_options_compat_json(&opts, transaction) {
+            Ok(value) => value,
+            Err(err) => return vec![Some(Error::other(err.to_string())); expected_len],
+        };
+        let versions_json = if transaction {
+            vec![String::new(); expected_len]
+        } else {
+            let mut encoded = Vec::with_capacity(expected_len);
+            for version in &versions {
+                encoded.push(match serde_json::to_string(version) {
+                    Ok(value) => value,
+                    Err(err) => return vec![Some(Error::other(err.to_string())); expected_len],
+                });
+            }
+            encoded
+        };
+        let mut versions_bin = Vec::with_capacity(expected_len);
+        for version in &versions {
+            versions_bin.push(match encode_msgpack(version) {
+                Ok(value) => Bytes::from(value),
+                Err(err) => return vec![Some(Error::other(err.to_string())); expected_len],
+            });
+        }
+        let operation = || async {
+            let mut client = if compensation {
+                self.get_client_allow_offline().await?
+            } else {
+                self.get_client().await?
+            };
+            let response = client
+                .delete_versions(Request::new(DeleteVersionsRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    versions: versions_json,
+                    opts: opts_json,
+                    versions_bin,
+                    opts_bin: Bytes::from(opts_bin),
+                }))
+                .await
+                .map_err(|err| Error::other(format!("delete_versions failed: {err}")))?
+                .into_inner();
+            if transaction && response.error.as_ref().is_some_and(is_delete_options_envelope_rejection) {
+                self.mutation_protocol_version
+                    .store(crate::disk::MUTATION_PROTOCOL_LEGACY, Ordering::Release);
+                return Err(Error::other(DELETE_TRANSACTION_UNSUPPORTED));
+            }
+            Ok(response)
+        };
+        let result = if transaction {
+            self.execute_with_timeout_for_op_and_health_action_inner(
+                if compensation {
+                    "delete_versions_compensation"
+                } else {
+                    "delete_versions_transaction"
+                },
+                operation,
+                get_max_timeout_duration(),
+                if compensation {
+                    FailureHealthAction::IgnoreFailure
+                } else {
+                    FailureHealthAction::MarkFailure
+                },
+                compensation,
+            )
+            .await
+        } else {
+            self.execute_with_timeout_for_op("delete_versions", operation, get_max_timeout_duration())
+                .await
+        };
+        let response = match result {
+            Ok(response) => response,
+            Err(err) => return vec![Some(err); expected_len],
+        };
+        if !response.success {
+            return vec![Some(Error::other(response.error.map(|error| error.error_info).unwrap_or_default())); expected_len];
+        }
+        normalize_delete_versions_errors(response.errors, expected_len)
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "trace", skip_all)]
@@ -1165,6 +1510,9 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     fn is_local(&self) -> bool {
         false
+    }
+    fn mutation_protocol_version(&self) -> u8 {
+        self.mutation_protocol_version.load(Ordering::Acquire)
     }
     #[tracing::instrument(level = "trace", skip_all)]
     fn host_name(&self) -> String {
@@ -1187,6 +1535,10 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         let mut lock = self.id.lock().await;
+        if *lock != id {
+            self.mutation_protocol_version
+                .store(crate::disk::MUTATION_PROTOCOL_UNKNOWN, Ordering::Release);
+        }
         *lock = id;
 
         Ok(())
@@ -1425,185 +1777,12 @@ impl DiskAPI for RemoteDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
-        trace!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            volume,
-            path,
-            op = "delete_version",
-            state = "started",
-            "Remote disk RPC started"
-        );
-
-        self.execute_with_timeout(
-            || async {
-                // `_bin` support for DeleteVersion is new (grpc-optimization P2); always dual-write
-                // JSON + msgpack until its fallback counter has read zero across a release window.
-                let file_info_bin = encode_msgpack(&fi)?;
-                let opts_bin = encode_msgpack(&opts)?;
-                let file_info = serde_json::to_string(&fi)?;
-                let opts = serde_json::to_string(&opts)?;
-
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteVersionRequest {
-                    disk: self.endpoint.to_string(),
-                    volume: volume.to_string(),
-                    path: path.to_string(),
-                    file_info,
-                    force_del_marker,
-                    opts,
-                    file_info_bin: file_info_bin.into(),
-                    opts_bin: opts_bin.into(),
-                });
-
-                let response = client.delete_version(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.delete_version_rpc(volume, path, fi, force_del_marker, opts, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
-        trace!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            volume,
-            version_count = versions.len(),
-            op = "delete_versions",
-            state = "started",
-            "Remote disk RPC started"
-        );
-
-        if self.health.is_faulty() {
-            return vec![Some(DiskError::FaultyDisk); versions.len()];
-        }
-
-        // `_bin` support for DeleteVersions is new (grpc-optimization P2); always dual-write JSON +
-        // msgpack until its fallback counter has read zero across a release window.
-        let opts_bin = match encode_msgpack(&opts) {
-            Ok(opts_bin) => opts_bin,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
-                }
-                return errors;
-            }
-        };
-        let opts = match serde_json::to_string(&opts) {
-            Ok(opts) => opts,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
-                }
-                return errors;
-            }
-        };
-        let mut versions_str = Vec::with_capacity(versions.len());
-        let mut versions_bin = Vec::with_capacity(versions.len());
-        for file_info_versions in versions.iter() {
-            versions_str.push(match serde_json::to_string(file_info_versions) {
-                Ok(versions_str) => versions_str,
-                Err(err) => {
-                    let mut errors = Vec::with_capacity(versions.len());
-                    for _ in 0..versions.len() {
-                        errors.push(Some(Error::other(err.to_string())));
-                    }
-                    return errors;
-                }
-            });
-            versions_bin.push(match encode_msgpack(file_info_versions) {
-                Ok(versions_bin) => Bytes::from(versions_bin),
-                Err(err) => {
-                    let mut errors = Vec::with_capacity(versions.len());
-                    for _ in 0..versions.len() {
-                        errors.push(Some(Error::other(err.to_string())));
-                    }
-                    return errors;
-                }
-            });
-        }
-        let mut client = match self.get_client().await {
-            Ok(client) => client,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
-                }
-                return errors;
-            }
-        };
-
-        let request = Request::new(DeleteVersionsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            versions: versions_str,
-            opts,
-            versions_bin,
-            opts_bin: opts_bin.into(),
-        });
-
-        // TODO: use Error not string
-
-        let result = self
-            .execute_with_timeout(
-                || async {
-                    client
-                        .delete_versions(request)
-                        .await
-                        .map_err(|err| Error::other(format!("delete_versions failed: {err}")))
-                },
-                get_max_timeout_duration(),
-            )
-            .await;
-
-        let response = match result {
-            Ok(response) => response,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(err.clone()));
-                }
-                return errors;
-            }
-        };
-
-        let response = response.into_inner();
-        if !response.success {
-            let mut errors = Vec::with_capacity(versions.len());
-            for _ in 0..versions.len() {
-                errors.push(Some(Error::other(response.error.clone().map(|e| e.error_info).unwrap_or_default())));
-            }
-            return errors;
-        }
-        response
-            .errors
-            .iter()
-            .map(|error| {
-                if error.is_empty() {
-                    None
-                } else {
-                    Some(Error::other(error.to_string()))
-                }
-            })
-            .collect()
+        self.delete_versions_rpc(volume, versions, opts, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -1621,16 +1800,14 @@ impl DiskAPI for RemoteDisk {
         );
         let paths = paths.to_owned();
 
-        self.execute_with_timeout(
-            || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+        self.execute_with_timeout_for_op(
+            "delete_paths",
+            || async move {
+                let mut client = self.get_client().await?;
                 let request = Request::new(DeletePathsRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
-                    paths: paths.clone(),
+                    paths,
                 });
 
                 let response = client.delete_paths(request).await?.into_inner();
@@ -1994,42 +2171,43 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout_for_op(
-            "rename_data",
-            || async {
-                let file_info = compat_json(&fi)?;
-                let file_info_bin = encode_msgpack_named(&fi)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenameDataRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    file_info,
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                    file_info_bin: file_info_bin.into(),
-                });
+        // Legacy peers may ignore file_info_bin, so retain JSON here.
+        let file_info = serde_json::to_string(&fi)?;
+        let file_info_bin = encode_msgpack_named(&fi)?;
+        match self
+            .send_rename_data_payload((src_volume, src_path), (dst_volume, dst_path), file_info, file_info_bin, false, false)
+            .await?
+        {
+            RenameDataRpcOutcome::Success(response) => Ok(response),
+            RenameDataRpcOutcome::TransactionUnsupported => Err(DiskError::Unexpected),
+        }
+    }
 
-                let response = client.rename_data(request).await?.into_inner();
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn rename_data_with_rollback_fenced(
+        &self,
+        src: (&str, &str),
+        fi: FileInfo,
+        dst: (&str, &str),
+        rollback_token: Uuid,
+        commit_lock: Option<rustfs_lock::LockId>,
+    ) -> Result<RenameDataResp> {
+        if rollback_token.is_nil() {
+            return Err(DiskError::other("rename rollback token must not be nil"));
+        }
 
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
-                    &response.rename_data_resp_bin,
-                    &response.rename_data_resp,
-                    "RenameDataResp",
-                )?;
-
-                Ok(rename_data_resp)
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        let envelope = encode_rename_data_envelope(&fi, rollback_token, commit_lock.as_ref())?;
+        match self
+            .send_rename_data_payload(src, dst, RENAME_DATA_LEGACY_JSON_PROBE.to_string(), envelope, true, true)
+            .await?
+        {
+            RenameDataRpcOutcome::Success(response) => Ok(response),
+            RenameDataRpcOutcome::TransactionUnsupported => {
+                self.mutation_protocol_version
+                    .store(crate::disk::MUTATION_PROTOCOL_LEGACY, Ordering::Release);
+                Err(Error::other(RENAME_TRANSACTION_UNSUPPORTED))
+            }
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -2678,6 +2856,8 @@ impl DiskAPI for RemoteDisk {
                 }
 
                 let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
+                let protocol_version = normalize_mutation_protocol_version(response.mutation_protocol_version);
+                self.mutation_protocol_version.store(protocol_version, Ordering::Release);
 
                 Ok(disk_info)
             },
@@ -3131,6 +3311,228 @@ mod tests {
     }
 
     #[test]
+    fn legacy_rename_envelope_rejection_match_is_exact() {
+        let expected = RpcError {
+            code: DiskError::other("").to_u32(),
+            error_info: format!(
+                "io error decode FileInfo failed: io error decode FileInfo msgpack failed: invalid type: integer `{RENAME_DATA_ENVELOPE_MAGIC}`, expected a string"
+            ),
+        };
+        assert!(is_legacy_rename_envelope_rejection(&expected));
+
+        let mut unrelated = expected;
+        unrelated.error_info.push_str(" (different)");
+        assert!(!is_legacy_rename_envelope_rejection(&unrelated));
+
+        let pre_bin = RpcError {
+            code: DiskError::other("").to_u32(),
+            error_info:
+                "io error decode FileInfo failed: invalid type: string \"rustfs-rename-transaction-v1\", expected struct FileInfo"
+                    .to_string(),
+        };
+        assert!(is_legacy_rename_envelope_rejection(&pre_bin));
+    }
+
+    #[test]
+    fn delete_options_compat_json_requires_msgpack_for_delete_rollback() {
+        let rollback_dir = Uuid::new_v4();
+        let forward_delete = DeleteOptions {
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+        let rollback_delete = DeleteOptions {
+            undo_write: true,
+            undo_delete: true,
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            delete_options_compat_json(&forward_delete, true).expect("forward delete options should encode"),
+            ""
+        );
+        assert_eq!(
+            delete_options_compat_json(&rollback_delete, true).expect("rollback delete options should encode"),
+            ""
+        );
+        assert!(
+            !delete_options_compat_json(&forward_delete, false)
+                .expect("legacy options should encode")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_options_compat_json_requires_envelope_for_write_rollback() {
+        let opts = DeleteOptions {
+            undo_write: true,
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let json = delete_options_compat_json(&opts, true).expect("write rollback options should encode");
+        assert!(json.is_empty());
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    struct PreRollbackDeleteOptions {
+        recursive: bool,
+        immediate: bool,
+        undo_write: bool,
+        old_data_dir: Option<Uuid>,
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    struct MergedDeleteOptions {
+        recursive: bool,
+        immediate: bool,
+        undo_write: bool,
+        undo_delete: bool,
+        old_data_dir: Option<Uuid>,
+    }
+
+    #[test]
+    fn delete_options_msgpack_decodes_legacy_compact_payload() {
+        for old_data_dir in [None, Some(Uuid::new_v4())] {
+            let legacy = PreRollbackDeleteOptions {
+                recursive: true,
+                immediate: false,
+                undo_write: true,
+                old_data_dir,
+            };
+            let encoded = encode_msgpack(&legacy).expect("legacy delete options should encode");
+            let decoded = crate::disk::decode_delete_options_payload(&encoded, "");
+
+            if old_data_dir.is_none() {
+                assert!(decoded.is_err(), "malformed legacy undo without rollback state must fail closed");
+                continue;
+            }
+            let decoded = decoded.expect("current delete options should decode valid pre-rollback compact msgpack");
+
+            assert!(decoded.options.recursive);
+            assert!(!decoded.options.immediate);
+            assert!(decoded.options.undo_write);
+            assert_eq!(decoded.options.old_data_dir, old_data_dir);
+            assert!(!decoded.options.undo_delete);
+        }
+
+        let merged = MergedDeleteOptions {
+            recursive: false,
+            immediate: true,
+            undo_write: true,
+            undo_delete: true,
+            old_data_dir: Some(Uuid::new_v4()),
+        };
+        let encoded = encode_msgpack(&merged).expect("merged delete options should encode");
+        let decoded = crate::disk::decode_delete_options_payload(&encoded, "")
+            .expect("current delete options should decode merged compact msgpack");
+        rmp_serde::from_slice::<PreRollbackDeleteOptions>(&encoded)
+            .expect_err("pre-rollback peer must reject merged compact layout before mutation");
+        assert!(decoded.options.undo_delete);
+        assert_eq!(decoded.options.old_data_dir, merged.old_data_dir);
+    }
+
+    #[test]
+    fn delete_options_envelope_rejection_match_requires_decode_boundary() {
+        let expected = RpcError {
+            code: DiskError::other("").to_u32(),
+            error_info: "io error decode DeleteOptions failed: invalid type: integer, expected struct".to_string(),
+        };
+        assert!(is_delete_options_envelope_rejection(&expected));
+
+        let mut post_mutation = expected.clone();
+        post_mutation.error_info = "delete version failed after metadata commit".to_string();
+        assert!(!is_delete_options_envelope_rejection(&post_mutation));
+
+        let mut embedded = expected.clone();
+        embedded.error_info = format!("wrapper: {DELETE_OPTIONS_DECODE_ERROR_PREFIX}invalid envelope");
+        assert!(!is_delete_options_envelope_rejection(&embedded));
+
+        let mut wrong_code = expected;
+        wrong_code.code = DiskError::FaultyDisk.to_u32();
+        assert!(!is_delete_options_envelope_rejection(&wrong_code));
+    }
+
+    #[test]
+    fn delete_versions_response_cardinality_must_match_request() {
+        let exact = normalize_delete_versions_errors(vec![String::new(), "failed".to_string()], 2);
+        assert!(exact[0].is_none());
+        assert!(exact[1].as_ref().is_some_and(|error| error.to_string().contains("failed")));
+
+        for response in [vec![String::new()], vec![String::new(), String::new(), String::new()]] {
+            let errors = normalize_delete_versions_errors(response, 2);
+            assert_eq!(errors.len(), 2);
+            assert!(errors.iter().all(Option::is_some));
+            assert!(errors.iter().all(|error| {
+                error
+                    .as_ref()
+                    .is_some_and(|error| error.to_string().contains("cardinality mismatch"))
+            }));
+        }
+    }
+
+    #[test]
+    fn delete_options_msgpack_allows_legacy_decode_for_compatible_options() {
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            ..Default::default()
+        };
+
+        let encoded = encode_delete_options_msgpack(&opts, None).expect("compatible delete options should encode");
+        let current_decoded: DeleteOptions =
+            rmp_serde::from_slice(&encoded).expect("current delete options should decode named msgpack");
+        let pre_rollback_decoded: PreRollbackDeleteOptions =
+            rmp_serde::from_slice(&encoded).expect("pre-rollback delete options should ignore added fields");
+        let merged_decoded: MergedDeleteOptions =
+            rmp_serde::from_slice(&encoded).expect("merged delete options should ignore appended fields");
+
+        assert!(current_decoded.recursive);
+        assert!(current_decoded.immediate);
+        assert!(!current_decoded.undo_write);
+        assert!(!current_decoded.undo_delete);
+        assert!(pre_rollback_decoded.recursive);
+        assert!(pre_rollback_decoded.immediate);
+        assert!(!pre_rollback_decoded.undo_write);
+        assert_eq!(pre_rollback_decoded.old_data_dir, None);
+        assert_eq!(merged_decoded.old_data_dir, None);
+    }
+
+    #[test]
+    fn delete_options_msgpack_rejects_legacy_decode_for_delete_rollback() {
+        let rollback_dir = Uuid::new_v4();
+        let rollback_options = [
+            DeleteOptions {
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        ];
+
+        for opts in rollback_options {
+            let commit_locks = std::collections::BTreeMap::new();
+            let encoded =
+                encode_delete_options_msgpack(&opts, Some(&commit_locks)).expect("delete rollback options should encode");
+            let current_decoded = crate::disk::decode_delete_options_payload(&encoded, "")
+                .expect("current delete rollback options should decode the transaction envelope");
+            let pre_rollback_err = rmp_serde::from_slice::<PreRollbackDeleteOptions>(&encoded)
+                .expect_err("pre-rollback options must reject the transaction envelope");
+            let merged_err = rmp_serde::from_slice::<MergedDeleteOptions>(&encoded)
+                .expect_err("merged options must reject the transaction envelope");
+
+            assert_eq!(current_decoded.options.old_data_dir, opts.old_data_dir);
+            assert!(current_decoded.commit_locks.is_some());
+            assert!(!pre_rollback_err.to_string().is_empty());
+            assert!(!merged_err.to_string().is_empty());
+        }
+    }
+
+    #[test]
     fn rename_data_file_info_named_msgpack_is_smaller_than_json() {
         let file_info = sample_rename_data_file_info();
         let json = serde_json::to_vec(&file_info).expect("file info json should encode");
@@ -3538,7 +3940,7 @@ mod tests {
                 // actually attempts a connectivity check. Under the new
                 // suspect-first semantics we only need to prove that the drive
                 // transitions away from a clean Online state at least once.
-                tokio::time::sleep(SKIP_IF_SUCCESS_BEFORE + Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 assert!(
                     remote_disk.offline_duration_secs().is_some(),
                     "missing listener should transition the drive through suspect/offline tracking"
@@ -3600,6 +4002,7 @@ mod tests {
                     base_addr.clone(),
                     endpoint,
                     Arc::clone(&health),
+                    Arc::new(AtomicU8::new(crate::disk::MUTATION_PROTOCOL_UNKNOWN)),
                     cancel_token.clone(),
                 ));
 
@@ -4208,6 +4611,9 @@ mod tests {
         )
         .await
         .expect("operation should succeed");
+        remote_disk
+            .mutation_protocol_version
+            .store(crate::disk::TRANSACTION_RPC_VERSION, Ordering::Release);
 
         let err = remote_disk
             .execute_with_timeout_for_op_and_health_action(
@@ -4224,6 +4630,7 @@ mod tests {
 
         assert!(err.to_string().contains("timeout"));
         assert!(remote_disk.is_online().await, "ignored timeout should not mark remote disk faulty");
+        assert_eq!(remote_disk.mutation_protocol_version(), crate::disk::TRANSACTION_RPC_VERSION);
     }
 
     #[tokio::test]
@@ -4454,6 +4861,9 @@ mod tests {
         )
         .await
         .expect("operation should succeed");
+        remote_disk
+            .mutation_protocol_version
+            .store(crate::disk::TRANSACTION_RPC_VERSION, Ordering::Release);
 
         let channel = TonicEndpoint::from_shared(addr.clone())
             .expect("operation should succeed")
@@ -4481,6 +4891,7 @@ mod tests {
             remote_disk.is_online().await,
             "ignored network-like error should not mark remote disk faulty"
         );
+        assert_eq!(remote_disk.mutation_protocol_version(), crate::disk::TRANSACTION_RPC_VERSION);
         assert!(
             runtime_sources::test_node_channel_is_cached(&addr).await,
             "ignored network-like error should not evict cached connection"

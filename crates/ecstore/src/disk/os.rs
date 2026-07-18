@@ -175,7 +175,7 @@ async fn acquire_file_sync_permits(disk_permits: Arc<Semaphore>) -> io::Result<(
 /// Keep the per-disk permit with the blocking syscall so cancellation cannot
 /// amplify work on a wedged disk. The global permit stays with the async waiter,
 /// allowing healthy disks to make progress after a timed-out request is dropped.
-async fn run_file_sync_blocking<T, F>(disk_permits: Arc<Semaphore>, work: F) -> io::Result<T>
+pub(crate) async fn run_file_sync_blocking<T, F>(disk_permits: Arc<Semaphore>, work: F) -> io::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,

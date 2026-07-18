@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 use futures::Stream;
-use rustfs_lock::{LockClient, LockRequest};
+use rustfs_lock::{LockClient, LockId, LockRequest};
 use rustfs_protos::{
     models::PingBodyBuilder,
     proto_gen::node_service::{
@@ -228,6 +228,57 @@ impl NodeService for MinimalLockNodeService {
                 lock_info: None,
             })),
         }
+    }
+
+    async fn refresh_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockId>(arg) {
+                Ok(lock_id) => {
+                    lock_ids.push(lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => results[idx] = lock_result_from_error(format!("can not decode args, err: {err}")),
+            }
+        }
+
+        if !lock_ids.is_empty() {
+            match self.lock_client.refresh_locks_batch(&lock_ids).await {
+                Ok(batch_results) if batch_results.len() == valid_indices.len() => {
+                    for (request_idx, success) in valid_indices.into_iter().zip(batch_results) {
+                        results[request_idx] = GenerallyLockResult {
+                            success,
+                            error_info: None,
+                            lock_info: None,
+                        };
+                    }
+                }
+                Ok(batch_results) => {
+                    let error = format!(
+                        "batch refresh backend returned {} results for {} requests",
+                        batch_results.len(),
+                        valid_indices.len()
+                    );
+                    for request_idx in valid_indices {
+                        results[request_idx] = lock_result_from_error(error.clone());
+                    }
+                }
+                Err(err) => {
+                    for request_idx in valid_indices {
+                        results[request_idx] = lock_result_from_error(format!("can not batch refresh, err: {err}"));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
     }
 
     async fn lock_batch(

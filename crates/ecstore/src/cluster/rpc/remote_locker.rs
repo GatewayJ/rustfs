@@ -15,11 +15,12 @@
 use crate::cluster::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use rustfs_lock::{
     LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
-    types::{LockId, LockMetadata, LockPriority},
+    types::{LOCK_BATCH_FALLBACK_CONCURRENCY, LockId, LockMetadata, LockPriority},
 };
-use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
+use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, GenerallyLockResult, PingRequest};
 use rustfs_protos::{
     ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
     proto_gen::node_service::node_service_client::NodeServiceClient,
@@ -35,6 +36,27 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
     addr: String,
+}
+
+fn invalid_batch_lock_response(
+    requests: &[LockRequest],
+    results: &[GenerallyLockResult],
+) -> Option<(Vec<LockId>, Vec<LockResponse>)> {
+    if results.len() == requests.len() {
+        return None;
+    }
+    let error = format!(
+        "Lock batch response cardinality mismatch: expected {}, got {}",
+        requests.len(),
+        results.len()
+    );
+    Some((
+        requests.iter().map(|request| request.lock_id.clone()).collect(),
+        requests
+            .iter()
+            .map(|_| LockResponse::failure(error.clone(), Duration::ZERO))
+            .collect(),
+    ))
 }
 
 impl RemoteClient {
@@ -152,6 +174,19 @@ impl RemoteClient {
         resources.join(", ")
     }
 
+    fn summarize_lock_ids(lock_ids: &[LockId]) -> String {
+        const LIMIT: usize = 3;
+        let mut resources = lock_ids
+            .iter()
+            .take(LIMIT)
+            .map(|lock_id| lock_id.resource.to_string())
+            .collect::<Vec<_>>();
+        if lock_ids.len() > LIMIT {
+            resources.push(format!("... (+{} more)", lock_ids.len() - LIMIT));
+        }
+        resources.join(", ")
+    }
+
     fn rpc_timeout() -> Duration {
         Duration::from_millis(
             rustfs_utils::get_env_u64(
@@ -252,41 +287,19 @@ impl RemoteClient {
             .collect()
     }
 
-    fn build_lock_info(request: &LockRequest, lock_info_json: Option<String>) -> LockInfo {
-        if let Some(lock_info_json) = lock_info_json {
-            match serde_json::from_str::<LockInfo>(&lock_info_json) {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("Failed to deserialize lock_info from response: {}, using request data", e);
-                    LockInfo {
-                        id: request.lock_id.clone(),
-                        resource: request.resource.clone(),
-                        lock_type: request.lock_type,
-                        status: LockStatus::Acquired,
-                        owner: request.owner.clone(),
-                        acquired_at: std::time::SystemTime::now(),
-                        expires_at: std::time::SystemTime::now() + request.ttl,
-                        last_refreshed: std::time::SystemTime::now(),
-                        metadata: request.metadata.clone(),
-                        priority: request.priority,
-                        wait_start_time: None,
-                    }
-                }
-            }
-        } else {
-            LockInfo {
-                id: request.lock_id.clone(),
-                resource: request.resource.clone(),
-                lock_type: request.lock_type,
-                status: LockStatus::Acquired,
-                owner: request.owner.clone(),
-                acquired_at: std::time::SystemTime::now(),
-                expires_at: std::time::SystemTime::now() + request.ttl,
-                last_refreshed: std::time::SystemTime::now(),
-                metadata: request.metadata.clone(),
-                priority: request.priority,
-                wait_start_time: None,
-            }
+    fn build_lock_info(request: &LockRequest) -> LockInfo {
+        LockInfo {
+            id: request.lock_id.clone(),
+            resource: request.resource.clone(),
+            lock_type: request.lock_type,
+            status: LockStatus::Acquired,
+            owner: request.owner.clone(),
+            acquired_at: std::time::SystemTime::now(),
+            expires_at: std::time::SystemTime::now() + request.ttl,
+            last_refreshed: std::time::SystemTime::now(),
+            metadata: request.metadata.clone(),
+            priority: request.priority,
+            wait_start_time: None,
         }
     }
 
@@ -304,6 +317,16 @@ impl RemoteClient {
             priority: LockPriority::Normal,
             wait_start_time: None,
         }
+    }
+
+    async fn refresh_locks_unary(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        futures::stream::iter(lock_ids.iter().cloned())
+            .map(|lock_id| async move { self.refresh(&lock_id).await })
+            .buffered(LOCK_BATCH_FALLBACK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
     }
 }
 
@@ -326,10 +349,7 @@ impl LockClient for RemoteClient {
 
         // Check if the lock acquisition was successful
         if resp.success {
-            Ok(LockResponse::success(
-                Self::build_lock_info(request, resp.lock_info),
-                std::time::Duration::ZERO,
-            ))
+            Ok(LockResponse::success(Self::build_lock_info(request), std::time::Duration::ZERO))
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
@@ -365,12 +385,19 @@ impl LockClient for RemoteClient {
             Err(err) => return Ok(Self::rpc_failure_batch(requests, &err)),
         };
 
+        if let Some((acquired, failures)) = invalid_batch_lock_response(requests, &resp.results) {
+            if let Err(err) = self.release_locks_batch(&acquired).await {
+                warn!(error = %err, "failed to clean locks after a batch response cardinality mismatch");
+            }
+            return Ok(failures);
+        }
+
         Ok(requests
             .iter()
             .enumerate()
             .map(|(idx, request)| match resp.results.get(idx) {
                 Some(result) if result.success => {
-                    LockResponse::success(Self::build_lock_info(request, result.lock_info.clone()), std::time::Duration::ZERO)
+                    LockResponse::success(Self::build_lock_info(request), std::time::Duration::ZERO)
                 }
                 Some(result) => LockResponse::failure(
                     result
@@ -428,6 +455,20 @@ impl LockClient for RemoteClient {
             .await?
             .into_inner();
 
+        if resp.results.len() != lock_ids.len() {
+            return futures::stream::iter(
+                lock_ids
+                    .iter()
+                    .cloned()
+                    .map(|lock_id| async move { self.release(&lock_id).await }),
+            )
+            .buffered(LOCK_BATCH_FALLBACK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect();
+        }
+
         Ok(lock_ids
             .iter()
             .enumerate()
@@ -436,7 +477,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote refresh for {}", lock_id);
+        debug!("remote refresh for {}", lock_id);
         let refresh_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let resource_summary = refresh_request.resource.to_string();
@@ -452,6 +493,59 @@ impl LockClient for RemoteClient {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
+    }
+
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        if lock_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resource_summary = Self::summarize_lock_ids(lock_ids);
+        let req = Request::new(BatchGenerallyLockRequest {
+            args: lock_ids
+                .iter()
+                .map(|lock_id| {
+                    serde_json::to_string(lock_id)
+                        .map_err(|err| LockError::internal(format!("Failed to serialize request: {err}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
+        let mut client = self.get_client().await?;
+        let rpc_timeout = Self::rpc_timeout();
+        let response = match timeout(rpc_timeout, client.refresh_batch(req)).await {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                return self.refresh_locks_unary(lock_ids).await;
+            }
+            Ok(Err(status)) => {
+                if Self::is_transport_failure(&status) {
+                    self.evict_connection("refresh_batch", &status.to_string(), &resource_summary)
+                        .await;
+                }
+                return Err(LockError::internal(format!("refresh_batch RPC failed: {status}")));
+            }
+            Err(_) => {
+                let reason = format!("RPC timed out after {rpc_timeout:?}");
+                self.evict_connection("refresh_batch", &reason, &resource_summary).await;
+                return Err(LockError::timeout(format!("remote lock RPC refresh_batch on {}", self.addr), rpc_timeout));
+            }
+        };
+
+        if response.results.len() != lock_ids.len() {
+            return Err(LockError::internal(format!(
+                "batch refresh returned {} results for {} requests",
+                response.results.len(),
+                lock_ids.len()
+            )));
+        }
+        response
+            .results
+            .into_iter()
+            .map(|result| match result.error_info {
+                Some(error) => Err(LockError::internal(error)),
+                None => Ok(result.success),
+            })
+            .collect()
     }
 
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
@@ -614,6 +708,36 @@ mod tests {
         LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner-a")
             .with_acquire_timeout(timeout_duration)
             .with_priority(LockPriority::Normal)
+    }
+
+    #[test]
+    fn invalid_batch_response_fails_every_request_and_cleans_request_ids() {
+        let requests = vec![test_lock_request(Duration::ZERO), test_lock_request(Duration::ZERO)];
+        for results in [
+            vec![GenerallyLockResult {
+                success: true,
+                error_info: None,
+                lock_info: None,
+            }],
+            vec![GenerallyLockResult::default(); 3],
+        ] {
+            let (cleanup, failures) = invalid_batch_lock_response(&requests, &results).expect("cardinality must be rejected");
+            assert_eq!(failures.len(), requests.len());
+            assert!(failures.iter().all(|response| !response.success));
+            assert!(requests.iter().all(|request| cleanup.contains(&request.lock_id)));
+        }
+
+        let unexpected = test_lock_request(Duration::ZERO).lock_id;
+        let mut results = vec![GenerallyLockResult::default(); 3];
+        results[0] = GenerallyLockResult {
+            success: true,
+            error_info: None,
+            lock_info: Some(
+                serde_json::to_string(&RemoteClient::unknown_lock_info(&unexpected)).expect("unexpected lock info should encode"),
+            ),
+        };
+        let (cleanup, _) = invalid_batch_lock_response(&requests, &results).expect("cardinality must be rejected");
+        assert!(!cleanup.contains(&unexpected), "peer-supplied lock IDs must never be released");
     }
 
     #[tokio::test]

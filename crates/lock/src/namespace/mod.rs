@@ -89,6 +89,14 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Exact backend id used to validate a storage commit.
+    pub fn commit_lock_id(&self) -> Option<&LockId> {
+        match self {
+            Self::Standard(guard) => guard.commit_lock_id(),
+            Self::Fast(_) => None,
+        }
+    }
+
     /// Get the object key if available (only for Fast guards)
     pub fn key(&self) -> Option<&ObjectKey> {
         match self {

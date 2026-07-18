@@ -130,6 +130,14 @@ mod serial_tests {
             .expect("failed to heal object");
         info!("heal_object result: {:?}, error: {:?}", object_result, object_error);
         assert!(object_error.is_none(), "heal_object returned error: {object_error:?}");
+        assert!(target_part.exists(), "heal cleanup removed the rebuilt shard");
+        assert!(
+            WalkDir::new(&obj_dir)
+                .into_iter()
+                .filter_map(Result::ok)
+                .all(|entry| entry.file_name() != "xl.meta.bkp"),
+            "heal left a rollback snapshot behind"
+        );
 
         // `test_heal_format_with_data` covers on-disk shard restoration. Here we
         // focus on the object-level healing contract: the object must remain

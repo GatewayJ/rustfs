@@ -266,6 +266,12 @@ async fn test_grpc_lock_client_batch_acquire_and_release() {
                 .clone()
         })
         .collect::<Vec<_>>();
+    let refreshed = grpc_client
+        .refresh_locks_batch(&lock_ids)
+        .await
+        .expect("batch refresh should succeed");
+    assert_eq!(refreshed, vec![true, true]);
+
     let released = grpc_client
         .release_locks_batch(&lock_ids)
         .await

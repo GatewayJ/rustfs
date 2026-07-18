@@ -38,6 +38,13 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+pub(crate) const RENAME_DATA_ENVELOPE_MAGIC: u64 = 0x5255_5354_4653_3433;
+const RENAME_DATA_ENVELOPE_VERSION: u8 = 2;
+pub(crate) const DELETE_OPTIONS_ENVELOPE_MAGIC: u64 = 0x5255_5354_4445_4c31;
+const DELETE_OPTIONS_ENVELOPE_VERSION: u8 = 2;
+pub const TRANSACTION_RPC_VERSION: u8 = 2;
+pub(crate) const MUTATION_PROTOCOL_UNKNOWN: u8 = 0;
+pub(crate) const MUTATION_PROTOCOL_LEGACY: u8 = 1;
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
@@ -52,7 +59,7 @@ use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, io::Cursor, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -83,6 +90,44 @@ pub enum Disk {
     Remote(Box<RemoteDisk>),
 }
 
+impl Disk {
+    #[doc(hidden)]
+    pub async fn delete_version_transaction(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        commit_locks: Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_transaction(volume, path, fi, force_del_marker, opts, commit_locks)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.delete_version_transaction(volume, path, fi, force_del_marker, opts, commit_locks)
+                    .await
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn delete_versions_transaction(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        commit_locks: Arc<std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+    ) -> Vec<Option<Error>> {
+        match self {
+            Self::Local(disk) => disk.delete_versions_transaction(volume, versions, opts, commit_locks).await,
+            Self::Remote(disk) => disk.delete_versions_transaction(volume, versions, opts, commit_locks).await,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
     fn to_string(&self) -> String {
@@ -103,6 +148,13 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.is_local(),
             Disk::Remote(remote_disk) => remote_disk.is_local(),
+        }
+    }
+
+    fn mutation_protocol_version(&self) -> u8 {
+        match self {
+            Disk::Local(local_disk) => local_disk.mutation_protocol_version(),
+            Disk::Remote(remote_disk) => remote_disk.mutation_protocol_version(),
         }
     }
 
@@ -284,6 +336,29 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
             Disk::Remote(remote_disk) => remote_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn rename_data_with_rollback_fenced(
+        &self,
+        src: (&str, &str),
+        fi: FileInfo,
+        dst: (&str, &str),
+        rollback_token: Uuid,
+        commit_lock: Option<rustfs_lock::LockId>,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_with_rollback_fenced(src, fi, dst, rollback_token, commit_lock)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .rename_data_with_rollback_fenced(src, fi, dst, rollback_token, commit_lock)
+                    .await
+            }
         }
     }
 
@@ -535,6 +610,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn to_string(&self) -> String;
     async fn is_online(&self) -> bool;
     fn is_local(&self) -> bool;
+    fn mutation_protocol_version(&self) -> u8 {
+        0
+    }
     // LastConn
     fn host_name(&self) -> String;
     fn endpoint(&self) -> Endpoint;
@@ -597,7 +675,25 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         file_info: FileInfo,
         dst_volume: &str,
         dst_path: &str,
-    ) -> Result<RenameDataResp>;
+    ) -> Result<RenameDataResp> {
+        self.rename_data_with_rollback_fenced((src_volume, src_path), file_info, (dst_volume, dst_path), Uuid::nil(), None)
+            .await
+    }
+    async fn rename_data_with_rollback_fenced(
+        &self,
+        _src: (&str, &str),
+        _file_info: FileInfo,
+        _dst: (&str, &str),
+        rollback_token: Uuid,
+        _commit_lock: Option<rustfs_lock::LockId>,
+    ) -> Result<RenameDataResp> {
+        if rollback_token.is_nil() {
+            return Err(DiskError::other("rename rollback token must not be nil"));
+        }
+        Err(DiskError::other(
+            "rename rollback transactions are not supported by this disk implementation",
+        ))
+    }
 
     // File operations.
     // Read every file and directory within the folder
@@ -866,7 +962,7 @@ pub enum OldCurrentSize {
     Present(i64),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
@@ -878,6 +974,92 @@ pub struct RenameDataResp {
     pub old_current_size: Option<OldCurrentSize>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameDataEnvelope {
+    magic: u64,
+    version: u8,
+    rollback_token: Uuid,
+    file_info: FileInfo,
+    #[serde(default)]
+    commit_lock: Option<rustfs_lock::LockId>,
+}
+
+#[derive(Serialize)]
+struct RenameDataEnvelopeRef<'a> {
+    magic: u64,
+    version: u8,
+    rollback_token: Uuid,
+    file_info: &'a FileInfo,
+    commit_lock: Option<&'a rustfs_lock::LockId>,
+}
+
+#[derive(Debug)]
+pub struct RenameDataPayload {
+    pub file_info: FileInfo,
+    pub rollback_token: Option<Uuid>,
+    pub commit_lock: Option<rustfs_lock::LockId>,
+}
+
+pub fn encode_rename_data_envelope(
+    file_info: &FileInfo,
+    rollback_token: Uuid,
+    commit_lock: Option<&rustfs_lock::LockId>,
+) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(&RenameDataEnvelopeRef {
+        magic: RENAME_DATA_ENVELOPE_MAGIC,
+        version: RENAME_DATA_ENVELOPE_VERSION,
+        rollback_token,
+        file_info,
+        commit_lock,
+    })?)
+}
+
+fn has_envelope_discriminator(binary: &[u8]) -> bool {
+    let mut cursor = Cursor::new(binary);
+    if rmp::decode::read_array_len(&mut cursor).is_ok() && rmp::decode::read_int::<u64, _>(&mut cursor).is_ok() {
+        return true;
+    }
+
+    rmp_serde::from_slice::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(binary)
+        .is_ok_and(|fields| fields.contains_key("magic"))
+}
+
+pub fn decode_rename_data_payload(binary: &[u8], json: &str) -> Result<RenameDataPayload> {
+    if binary.is_empty() {
+        return Ok(RenameDataPayload {
+            file_info: serde_json::from_str(json)?,
+            rollback_token: None,
+            commit_lock: None,
+        });
+    }
+
+    if has_envelope_discriminator(binary) {
+        let envelope: RenameDataEnvelope = rmp_serde::from_slice(binary)
+            .map_err(|err| DiskError::other(format!("decode rename data envelope failed: {err}")))?;
+        if envelope.magic != RENAME_DATA_ENVELOPE_MAGIC {
+            return Err(DiskError::other("rename data envelope magic mismatch"));
+        }
+        if envelope.version != RENAME_DATA_ENVELOPE_VERSION {
+            return Err(DiskError::other(format!("unsupported rename data envelope version {}", envelope.version)));
+        }
+        if envelope.rollback_token.is_nil() {
+            return Err(DiskError::other("rename data envelope contains a nil rollback token"));
+        }
+        return Ok(RenameDataPayload {
+            file_info: envelope.file_info,
+            rollback_token: Some(envelope.rollback_token),
+            commit_lock: envelope.commit_lock,
+        });
+    }
+
+    Ok(RenameDataPayload {
+        file_info: rmp_serde::from_slice(binary)?,
+        rollback_token: None,
+        commit_lock: None,
+    })
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteOptions {
     pub recursive: bool,
@@ -886,6 +1068,161 @@ pub struct DeleteOptions {
     #[serde(default)]
     pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+}
+
+const INVALID_DELETE_ROLLBACK_OPTIONS: &str = "undo_delete requires undo_write and old_data_dir";
+const INVALID_WRITE_ROLLBACK_OPTIONS: &str = "undo_write requires rollback state";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteOptionsEnvelope {
+    magic: u64,
+    version: u8,
+    options: DeleteOptions,
+    commit_locks: std::collections::BTreeMap<String, rustfs_lock::LockId>,
+}
+
+#[derive(Serialize)]
+struct DeleteOptionsEnvelopeRef<'a> {
+    magic: u64,
+    version: u8,
+    options: &'a DeleteOptions,
+    commit_locks: &'a std::collections::BTreeMap<String, rustfs_lock::LockId>,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct DecodedDeleteOptions {
+    pub options: DeleteOptions,
+    pub commit_locks: Option<std::collections::BTreeMap<String, rustfs_lock::LockId>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyDeleteOptions {
+    recursive: bool,
+    immediate: bool,
+    undo_write: bool,
+    old_data_dir: Option<Uuid>,
+}
+
+impl DeleteOptions {
+    pub fn requires_delete_rollback_protocol(&self) -> bool {
+        self.undo_write || self.undo_delete || self.old_data_dir.is_some()
+    }
+
+    pub(crate) fn validate_delete_rollback(&self) -> Result<()> {
+        if self.undo_write && self.old_data_dir.is_none() {
+            return Err(DiskError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                INVALID_WRITE_ROLLBACK_OPTIONS,
+            )));
+        }
+        if self.undo_delete && (!self.undo_write || self.old_data_dir.is_none()) {
+            return Err(DiskError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                INVALID_DELETE_ROLLBACK_OPTIONS,
+            )));
+        }
+        if self.old_data_dir.is_some_and(|token| token.is_nil()) {
+            return Err(DiskError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "old_data_dir transaction token must not be nil",
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_compensation(&self) -> bool {
+        self.undo_write
+    }
+}
+
+pub(crate) fn validate_delete_transaction_commit_locks<'a, I>(
+    options: &DeleteOptions,
+    commit_locks: &std::collections::BTreeMap<String, rustfs_lock::LockId>,
+    volume: &str,
+    paths: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    options.validate_delete_rollback()?;
+    if commit_locks.is_empty() {
+        return Ok(());
+    }
+    let mut path_count = 0;
+    let paths: std::collections::HashSet<_> = paths.into_iter().inspect(|_| path_count += 1).collect();
+    if path_count != paths.len()
+        || commit_locks.len() != paths.len()
+        || paths.iter().any(|path| {
+            commit_locks
+                .get(*path)
+                .is_none_or(|lock_id| lock_id.resource.bucket.as_ref() != volume || lock_id.resource.object.as_ref() != *path)
+        })
+    {
+        return Err(DiskError::other("transaction commit locks must exactly match the delete request"));
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_delete_options_envelope(
+    options: &DeleteOptions,
+    commit_locks: &std::collections::BTreeMap<String, rustfs_lock::LockId>,
+) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec(&DeleteOptionsEnvelopeRef {
+        magic: DELETE_OPTIONS_ENVELOPE_MAGIC,
+        version: DELETE_OPTIONS_ENVELOPE_VERSION,
+        options,
+        commit_locks,
+    })?)
+}
+
+pub fn decode_delete_options_payload(binary: &[u8], json: &str) -> Result<DecodedDeleteOptions> {
+    let payload = if binary.is_empty() {
+        DecodedDeleteOptions {
+            options: serde_json::from_str(json)?,
+            commit_locks: None,
+        }
+    } else if has_envelope_discriminator(binary) {
+        let envelope: DeleteOptionsEnvelope = rmp_serde::from_slice(binary)
+            .map_err(|err| DiskError::other(format!("decode delete options envelope failed: {err}")))?;
+        if envelope.magic != DELETE_OPTIONS_ENVELOPE_MAGIC {
+            return Err(DiskError::other("delete options envelope magic mismatch"));
+        }
+        if envelope.version != DELETE_OPTIONS_ENVELOPE_VERSION {
+            return Err(DiskError::other(format!(
+                "unsupported delete options envelope version {}",
+                envelope.version
+            )));
+        }
+        DecodedDeleteOptions {
+            options: envelope.options,
+            commit_locks: Some(envelope.commit_locks),
+        }
+    } else if let Ok(options) = rmp_serde::from_slice::<DeleteOptions>(binary) {
+        DecodedDeleteOptions {
+            options,
+            commit_locks: None,
+        }
+    } else {
+        let legacy: LegacyDeleteOptions = rmp_serde::from_slice(binary)?;
+        DecodedDeleteOptions {
+            options: DeleteOptions {
+                recursive: legacy.recursive,
+                immediate: legacy.immediate,
+                undo_write: legacy.undo_write,
+                old_data_dir: legacy.old_data_dir,
+                ..Default::default()
+            },
+            commit_locks: None,
+        }
+    };
+
+    payload.options.validate_delete_rollback()?;
+    if payload.commit_locks.is_some() && !payload.options.requires_delete_rollback_protocol() {
+        return Err(DiskError::other("delete transaction requires rollback state"));
+    }
+    Ok(payload)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -996,6 +1333,102 @@ mod tests {
     use local::LocalDisk;
     use tokio::fs;
     use uuid::Uuid;
+
+    fn rename_payload_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            size: 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_data_envelope_is_rejected_by_legacy_file_info_decoder() {
+        let file_info = rename_payload_file_info();
+        let encoded = encode_rename_data_envelope(&file_info, Uuid::new_v4(), None).expect("rename envelope should encode");
+        let error = rmp_serde::from_slice::<FileInfo>(&encoded)
+            .expect_err("legacy FileInfo decoder must reject the transaction envelope");
+
+        assert_eq!(error.to_string(), "missing field `volume`");
+    }
+
+    #[test]
+    fn rename_data_payload_decodes_new_and_legacy_encodings() {
+        let file_info = rename_payload_file_info();
+        let rollback_token = Uuid::new_v4();
+        let commit_lock = rustfs_lock::LockId::new(rustfs_lock::ObjectKey::new("bucket", "object"));
+        let envelope =
+            encode_rename_data_envelope(&file_info, rollback_token, Some(&commit_lock)).expect("rename envelope should encode");
+        let decoded = decode_rename_data_payload(&envelope, "").expect("rename envelope should decode");
+        assert_eq!(decoded.file_info, file_info);
+        assert_eq!(decoded.rollback_token, Some(rollback_token));
+        assert_eq!(decoded.commit_lock, Some(commit_lock));
+
+        let legacy_compact = rmp_serde::to_vec(&file_info).expect("legacy compact FileInfo should encode");
+        let decoded = decode_rename_data_payload(&legacy_compact, "").expect("legacy compact FileInfo should decode");
+        assert_eq!(decoded.file_info, file_info);
+        assert_eq!(decoded.rollback_token, None);
+        assert_eq!(decoded.commit_lock, None);
+
+        let legacy_named = rmp_serde::to_vec_named(&file_info).expect("legacy named FileInfo should encode");
+        let decoded = decode_rename_data_payload(&legacy_named, "").expect("legacy named FileInfo should decode");
+        assert_eq!(decoded.file_info, file_info);
+        assert_eq!(decoded.rollback_token, None);
+        assert_eq!(decoded.commit_lock, None);
+
+        let legacy_json = serde_json::to_string(&file_info).expect("legacy JSON FileInfo should encode");
+        let decoded = decode_rename_data_payload(&[], &legacy_json).expect("legacy JSON FileInfo should decode");
+        assert_eq!(decoded.file_info, file_info);
+        assert_eq!(decoded.rollback_token, None);
+        assert_eq!(decoded.commit_lock, None);
+    }
+
+    #[test]
+    fn rename_data_payload_rejects_nil_transaction_token() {
+        let file_info = rename_payload_file_info();
+        let envelope = encode_rename_data_envelope(&file_info, Uuid::nil(), None).expect("rename envelope should encode");
+        let error = decode_rename_data_payload(&envelope, "").expect_err("nil transaction token must fail closed");
+
+        assert!(error.to_string().contains("nil rollback token"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rename_data_payload_never_falls_back_after_envelope_discriminator() {
+        let file_info = rename_payload_file_info();
+        let truncated = rmp_serde::to_vec(&(RENAME_DATA_ENVELOPE_MAGIC, RENAME_DATA_ENVELOPE_VERSION))
+            .expect("truncated envelope should encode");
+        assert!(decode_rename_data_payload(&truncated, "").is_err());
+
+        let wrong_magic = rmp_serde::to_vec(&RenameDataEnvelope {
+            magic: RENAME_DATA_ENVELOPE_MAGIC + 1,
+            version: RENAME_DATA_ENVELOPE_VERSION,
+            rollback_token: Uuid::new_v4(),
+            file_info: file_info.clone(),
+            commit_lock: None,
+        })
+        .expect("wrong-magic envelope should encode");
+        let error = decode_rename_data_payload(&wrong_magic, "").expect_err("wrong envelope magic must fail closed");
+        assert!(error.to_string().contains("magic mismatch"));
+
+        let mut polyglot = serde_json::to_value(&file_info)
+            .expect("FileInfo should convert to a value")
+            .as_object()
+            .expect("FileInfo should encode as a map")
+            .clone();
+        polyglot.insert("magic".to_string(), RENAME_DATA_ENVELOPE_MAGIC.into());
+        polyglot.insert("version".to_string(), RENAME_DATA_ENVELOPE_VERSION.into());
+        polyglot.insert(
+            "rollback_token".to_string(),
+            serde_json::to_value(Uuid::new_v4()).expect("UUID should encode"),
+        );
+        let polyglot = rmp_serde::to_vec_named(&polyglot).expect("polyglot payload should encode");
+        assert!(
+            decode_rename_data_payload(&polyglot, "").is_err(),
+            "a named map with magic must not fall back to FileInfo"
+        );
+    }
 
     /// Test DiskLocation validation
     #[test]
@@ -1133,6 +1566,86 @@ mod tests {
         assert!(opts.undo_write);
         assert!(!opts.undo_delete);
         assert!(opts.old_data_dir.is_some());
+    }
+
+    #[test]
+    fn delete_options_detect_delete_rollback_protocol_requirement() {
+        let token = Uuid::new_v4();
+        let options = |undo_write, undo_delete, old_data_dir| DeleteOptions {
+            undo_write,
+            undo_delete,
+            old_data_dir,
+            ..Default::default()
+        };
+        for (name, opts, requires_protocol, valid) in [
+            ("default", options(false, false, None), false, true),
+            ("write", options(true, false, Some(token)), true, true),
+            ("forward", options(false, false, Some(token)), true, true),
+            ("rollback", options(true, true, Some(token)), true, true),
+            ("delete-without-state", options(false, true, None), true, false),
+            ("write-without-state", options(true, false, None), true, false),
+            ("nil-state", options(false, false, Some(Uuid::nil())), true, false),
+            ("delete-without-write", options(false, true, Some(token)), true, false),
+        ] {
+            assert_eq!(opts.requires_delete_rollback_protocol(), requires_protocol, "{name}");
+            assert_eq!(opts.validate_delete_rollback().is_ok(), valid, "{name}");
+        }
+        let commit_lock = rustfs_lock::LockId::new(rustfs_lock::ObjectKey::new("bucket", "object"));
+        let fenced = options(false, false, Some(token));
+        let commit_locks = std::collections::BTreeMap::from([("object".to_string(), commit_lock)]);
+        assert!(validate_delete_transaction_commit_locks(&fenced, &Default::default(), "bucket", ["object"]).is_ok());
+        assert!(validate_delete_transaction_commit_locks(&fenced, &commit_locks, "bucket", ["object"]).is_ok());
+        assert!(validate_delete_transaction_commit_locks(&fenced, &commit_locks, "bucket", ["object", "object"]).is_err());
+    }
+
+    #[test]
+    fn delete_options_payload_decodes_legacy_compact_and_named_encodings() {
+        let options = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            ..Default::default()
+        };
+
+        for encoded in [
+            rmp_serde::to_vec(&options).expect("compact DeleteOptions should encode"),
+            rmp_serde::to_vec_named(&options).expect("named DeleteOptions should encode"),
+        ] {
+            let decoded = decode_delete_options_payload(&encoded, "").expect("legacy DeleteOptions should decode");
+            assert!(decoded.options.recursive);
+            assert!(decoded.options.immediate);
+            assert!(decoded.commit_locks.is_none());
+        }
+    }
+
+    #[test]
+    fn delete_options_payload_never_falls_back_after_envelope_discriminator() {
+        let options = DeleteOptions::default();
+        let truncated = rmp_serde::to_vec(&(DELETE_OPTIONS_ENVELOPE_MAGIC, DELETE_OPTIONS_ENVELOPE_VERSION))
+            .expect("truncated envelope should encode");
+        assert!(decode_delete_options_payload(&truncated, "").is_err());
+
+        let wrong_magic = rmp_serde::to_vec_named(&DeleteOptionsEnvelope {
+            magic: DELETE_OPTIONS_ENVELOPE_MAGIC + 1,
+            version: DELETE_OPTIONS_ENVELOPE_VERSION,
+            options: options.clone(),
+            commit_locks: Default::default(),
+        })
+        .expect("wrong-magic envelope should encode");
+        let error = decode_delete_options_payload(&wrong_magic, "").expect_err("wrong envelope magic must fail closed");
+        assert!(error.to_string().contains("magic mismatch"));
+
+        let mut polyglot = serde_json::to_value(&options)
+            .expect("DeleteOptions should convert to a value")
+            .as_object()
+            .expect("DeleteOptions should encode as a map")
+            .clone();
+        polyglot.insert("magic".to_string(), DELETE_OPTIONS_ENVELOPE_MAGIC.into());
+        polyglot.insert("version".to_string(), DELETE_OPTIONS_ENVELOPE_VERSION.into());
+        let polyglot = rmp_serde::to_vec_named(&polyglot).expect("polyglot payload should encode");
+        assert!(
+            decode_delete_options_payload(&polyglot, "").is_err(),
+            "a named map with magic must not fall back to DeleteOptions"
+        );
     }
 
     /// Test ReadOptions structure
