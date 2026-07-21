@@ -1355,6 +1355,7 @@ mod tests {
         let err = map_add_user_create_error(IamError::AccessKeyAlreadyExists);
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("access key is already in use"));
     }
 

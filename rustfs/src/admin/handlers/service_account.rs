@@ -28,7 +28,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials as StoredCredentials;
-use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
+use rustfs_iam::error::{Error as IamError, is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{
@@ -153,6 +153,15 @@ fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) ->
         iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
+    }
+}
+
+fn map_add_service_account_create_error(err: IamError) -> S3Error {
+    match err {
+        IamError::InvalidAccessKeyLength | IamError::InvalidSecretKeyLength | IamError::AccessKeyAlreadyExists => {
+            iam_error_to_s3_error(err)
+        }
+        err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
     }
 }
 
@@ -387,7 +396,7 @@ impl Operation for AddServiceAccount {
         let (new_cred, _) = iam_store
             .new_service_account(&target_user, target_groups, opts)
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 debug!(
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
@@ -397,13 +406,8 @@ impl Operation for AddServiceAccount {
                     error = ?e,
                     "admin service account state"
                 );
-                match e {
-                    rustfs_iam::error::Error::InvalidAccessKeyLength
-                    | rustfs_iam::error::Error::InvalidSecretKeyLength
-                    | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
-                    err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
-                }
-            })?;
+            })
+            .map_err(map_add_service_account_create_error)?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "service-account".to_string(),
@@ -1569,20 +1573,34 @@ mod tests {
 
     #[test]
     fn add_service_account_maps_iam_create_errors_to_s3_errors() {
-        let src = include_str!("service_account.rs");
-        let create_start = src
-            .find("impl Operation for AddServiceAccount")
-            .expect("AddServiceAccount operation should exist");
-        let create_block = &src[create_start..];
-        let create_end = create_block
-            .find("if let Err(err) = site_replication_iam_change_hook")
-            .expect("site replication hook marker should exist");
-        let create_block = &create_block[..create_end];
+        for iam_error in [
+            IamError::InvalidAccessKeyLength,
+            IamError::InvalidSecretKeyLength,
+            IamError::AccessKeyAlreadyExists,
+        ] {
+            let err = map_add_service_account_create_error(iam_error);
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        }
 
-        assert!(
-            create_block.contains("AccessKeyAlreadyExists") && create_block.contains("iam_error_to_s3_error(e)"),
-            "duplicate access keys must map to client S3 errors"
-        );
+        let err = map_add_service_account_create_error(IamError::AccessKeyAlreadyExists);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("access key is already in use"));
+    }
+
+    #[test]
+    fn add_service_account_operation_returns_create_error_mapper_result() {
+        let mapper_call = concat!(".map_err(map_add_service_account_", "create_error)?");
+
+        assert!(include_str!("service_account.rs").contains(mapper_call));
+    }
+
+    #[test]
+    fn add_service_account_preserves_internal_error_fallback() {
+        let err = map_add_service_account_create_error(IamError::IamSysNotInitialized);
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("create service account failed, e: IamSysNotInitialized"));
     }
 
     #[test]

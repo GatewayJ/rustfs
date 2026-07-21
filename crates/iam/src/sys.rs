@@ -1736,6 +1736,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_account_creation_rejects_regular_user_access_key() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let access_key = "REGULARUSERACCESSKEY1";
+        let user = AddOrUpdateUserReq {
+            secret_key: "regularUserSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+
+        iam_sys
+            .store
+            .add_user(access_key, &user)
+            .await
+            .expect("regular user should be created");
+
+        let err = iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "serviceAccountSecret123"))
+            .await
+            .expect_err("service-account creation must reject a regular-user access key");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+        let existing = iam_sys.get_user(access_key).await.expect("regular user should remain cached");
+        assert!(!existing.credentials.is_service_account());
+        assert_eq!(existing.credentials.secret_key, user.secret_key);
+    }
+
+    #[tokio::test]
+    async fn service_account_creation_rejects_sts_access_key() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let access_key = "TEMPORARYSERVICEKEY12";
+        let temp_cred = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "temporarySecretKey123".to_string(),
+            session_token: "temporary-session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: "sts-parent-user".to_string(),
+            ..Default::default()
+        };
+
+        iam_sys
+            .set_temp_user(access_key, &temp_cred, None)
+            .await
+            .expect("temporary credentials should be created");
+
+        let err = iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "serviceAccountSecret123"))
+            .await
+            .expect_err("service-account creation must reject a temporary access key");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+        let existing = iam_sys
+            .get_user(access_key)
+            .await
+            .expect("temporary account should remain cached");
+        assert!(existing.credentials.is_temp());
+        assert_eq!(existing.credentials.secret_key, temp_cred.secret_key);
+    }
+
+    #[tokio::test]
     async fn user_creation_rejects_service_account_access_key() {
         ensure_test_global_credentials();
 
