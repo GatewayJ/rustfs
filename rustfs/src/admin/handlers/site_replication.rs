@@ -56,7 +56,6 @@ use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
 };
-use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{
@@ -6312,21 +6311,8 @@ pub(crate) fn encode_service_account_replication_policy(
 #[derive(Debug)]
 struct ReplicatedServiceAccountPolicy {
     policy: Option<Policy>,
+    #[cfg(test)]
     is_envelope: bool,
-}
-
-impl ReplicatedServiceAccountPolicy {
-    fn for_existing_account(self) -> Option<Policy> {
-        if self.is_envelope {
-            Some(self.policy.unwrap_or_default())
-        } else {
-            self.policy
-        }
-    }
-
-    fn metadata_for_existing_account(&self, value: String) -> Option<String> {
-        (self.is_envelope || !value.is_empty()).then_some(value)
-    }
 }
 
 fn decode_service_account_replication_policy(
@@ -6342,6 +6328,7 @@ fn decode_service_account_replication_policy(
     let Some(envelope) = envelope else {
         return Ok(Some(ReplicatedServiceAccountPolicy {
             policy: create.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok()),
+            #[cfg(test)]
             is_envelope: false,
         }));
     };
@@ -6367,6 +6354,7 @@ fn decode_service_account_replication_policy(
     let policy = (!policy.id.is_empty() || !policy.version.is_empty() || !policy.statements.is_empty()).then_some(policy);
     Ok(Some(ReplicatedServiceAccountPolicy {
         policy,
+        #[cfg(test)]
         is_envelope: true,
     }))
 }
@@ -6502,6 +6490,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                     }
                     ReplicatedServiceAccountPolicy {
                         policy: Some(site_replicator_service_account_policy()?),
+                        #[cfg(test)]
                         is_envelope: false,
                     }
                 } else {
@@ -6516,61 +6505,29 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                     };
                     replicated_policy
                 };
-                match iam_sys.get_service_account(&create.access_key).await {
-                    Ok((existing, _)) => {
-                        if existing.parent_user != create.parent {
-                            return Err(s3_error!(
-                                InvalidRequest,
-                                "service account {} already exists with a different parent user",
-                                create.access_key
-                            ));
-                        }
-                        iam_sys
-                            .update_service_account(
-                                &create.access_key,
-                                UpdateServiceAccountOpts {
-                                    name: replicated_policy.metadata_for_existing_account(create.name),
-                                    description: replicated_policy.metadata_for_existing_account(create.description),
-                                    session_policy: replicated_policy.for_existing_account(),
-                                    secret_key: Some(create.secret_key),
-                                    expiration: create.expiration,
-                                    status: (!create.status.is_empty()).then_some(create.status),
-                                    allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                                },
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                    Err(err) if is_err_no_such_service_account(&err) => {
-                        iam_sys
-                            .new_service_account(
-                                &create.parent,
-                                Some(create.groups),
-                                NewServiceAccountOpts {
-                                    session_policy: replicated_policy.policy,
-                                    access_key: create.access_key,
-                                    secret_key: create.secret_key,
-                                    name: (!create.name.is_empty()).then_some(create.name),
-                                    description: (!create.description.is_empty()).then_some(create.description),
-                                    expiration: create.expiration,
-                                    allow_site_replicator_account: true,
-                                    claims: Some(create.claims),
-                                },
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                    Err(err) => return Err(ApiError::from(err).into()),
-                }
+                iam_sys
+                    .upsert_replicated_service_account(
+                        &create.parent,
+                        create.groups,
+                        NewServiceAccountOpts {
+                            session_policy: replicated_policy.policy,
+                            access_key: create.access_key,
+                            secret_key: create.secret_key,
+                            name: (!create.name.is_empty()).then_some(create.name),
+                            description: (!create.description.is_empty()).then_some(create.description),
+                            expiration: create.expiration,
+                            allow_site_replicator_account: true,
+                            claims: Some(create.claims),
+                        },
+                        &create.status,
+                        incoming_updated_at,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
                 return Ok(());
             }
 
             if let Some(update) = change.update {
-                if let Some(local) = iam_sys.get_user(&update.access_key).await
-                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-                {
-                    return Ok(());
-                }
                 let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
                 let session_policy = if allow_site_replicator_account {
                     Some(site_replicator_service_account_policy()?)
@@ -6578,7 +6535,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                     update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
                 };
                 iam_sys
-                    .update_service_account(
+                    .update_replicated_service_account(
                         &update.access_key,
                         UpdateServiceAccountOpts {
                             session_policy,
@@ -6589,6 +6546,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                             status: (!update.status.is_empty()).then_some(update.status),
                             allow_site_replicator_account,
                         },
+                        incoming_updated_at,
                     )
                     .await
                     .map_err(ApiError::from)?;
@@ -6596,13 +6554,8 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             }
 
             if let Some(delete) = change.delete {
-                if let Some(local) = iam_sys.get_user(&delete.access_key).await
-                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-                {
-                    return Ok(());
-                }
                 iam_sys
-                    .delete_service_account(&delete.access_key, true)
+                    .delete_replicated_service_account(&delete.access_key, incoming_updated_at)
                     .await
                     .map_err(ApiError::from)?;
                 return Ok(());
@@ -8118,7 +8071,7 @@ mod tests {
     }
 
     #[test]
-    fn oidc_service_account_envelope_clears_policy_on_existing_account() {
+    fn oidc_service_account_envelope_decodes_inherited_policy() {
         let updated_at = OffsetDateTime::UNIX_EPOCH;
         let claims =
             HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]);
@@ -8153,12 +8106,6 @@ mod tests {
 
         assert!(decoded.is_envelope);
         assert!(decoded.policy.is_none());
-        assert_eq!(decoded.metadata_for_existing_account(String::new()), Some(String::new()));
-        let update_policy = decoded
-            .for_existing_account()
-            .expect("existing account needs an explicit clear");
-        assert!(update_policy.version.is_empty());
-        assert!(update_policy.statements.is_empty());
     }
 
     #[test]
@@ -8191,7 +8138,6 @@ mod tests {
             serde_json::to_value(restored).expect("serialize restored policy"),
             serde_json::from_str::<Value>(actual_policy).expect("parse expected policy")
         );
-        assert!(decoded.for_existing_account().is_some());
     }
 
     #[test]

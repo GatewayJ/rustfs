@@ -34,7 +34,7 @@ use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
 use rustfs_policy::auth::{
-    ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
+    ACCOUNT_OFF, ACCOUNT_ON, UserIdentity, contains_reserved_chars, create_new_credentials_with_metadata, generate_credentials,
     is_access_key_valid, is_secret_key_valid,
 };
 use rustfs_policy::policy::Args;
@@ -65,6 +65,14 @@ static POLICY_PLUGIN_CLIENT: OnceLock<Arc<RwLock<Option<rustfs_policy::policy::o
 
 fn get_policy_plugin_client() -> Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>> {
     POLICY_PLUGIN_CLIENT.get_or_init(|| Arc::new(RwLock::new(None))).clone()
+}
+
+async fn notify_service_account(name: &str) {
+    for result in notify_iam_load_service_account(name).await {
+        if let Some(err) = result.err {
+            warn!("notify load_service_account failed: {}", err);
+        }
+    }
 }
 
 pub struct IamSys<T> {
@@ -377,22 +385,6 @@ impl<T: Store> IamSys<T> {
         });
     }
 
-    async fn notify_for_service_account(&self, name: &str) {
-        if self.has_watcher() {
-            return;
-        }
-
-        // Fire-and-forget notification to peers - don't block service account operations
-        let name = name.to_string();
-        tokio::spawn(async move {
-            for r in notify_iam_load_service_account(&name).await {
-                if let Some(err) = r.err {
-                    warn!("notify load_service_account failed (non-blocking): {}", err);
-                }
-            }
-        });
-    }
-
     pub async fn current_policies(&self, name: &str) -> String {
         self.store.merge_policies(name).await.0
     }
@@ -453,83 +445,50 @@ impl<T: Store> IamSys<T> {
         groups: Option<Vec<String>>,
         opts: NewServiceAccountOpts,
     ) -> Result<(Credentials, OffsetDateTime)> {
-        if parent_user.is_empty() {
-            return Err(IamError::InvalidArgument);
-        }
-        if !opts.access_key.is_empty() && opts.secret_key.is_empty() {
-            return Err(IamError::NoSecretKeyWithAccessKey);
-        }
-
-        if !opts.secret_key.is_empty() && opts.access_key.is_empty() {
-            return Err(IamError::NoAccessKeyWithSecretKey);
-        }
-
-        if parent_user == opts.access_key {
-            return Err(IamError::AccessKeyAlreadyExists);
-        }
-
-        if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
-            return Err(IamError::IAMActionNotAllowed);
-        }
-
-        let policy_buf = if let Some(policy) = opts.session_policy {
-            policy.validate()?;
-            let buf = serde_json::to_vec(&policy)?;
-            if buf.len() > MAX_SVCSESSION_POLICY_SIZE {
-                return Err(IamError::PolicyTooLarge);
+        let cred = build_service_account_credentials(parent_user, groups, opts)?;
+        let store = Arc::clone(&self.store);
+        let notify = !self.has_watcher();
+        tokio::spawn(async move {
+            let create_at = store.add_service_account(cred.clone()).await?;
+            if notify {
+                notify_service_account(&cred.access_key).await;
             }
+            Ok((cred, create_at))
+        })
+        .await
+        .map_err(|err| IamError::other(format!("service account create task failed: {err}")))?
+    }
 
-            buf
-        } else {
-            Vec::new()
-        };
-
-        let mut m: HashMap<String, Value> = HashMap::new();
-        m.insert("parent".to_owned(), Value::String(parent_user.to_owned()));
-        if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
-            m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+    pub async fn upsert_replicated_service_account(
+        &self,
+        parent_user: &str,
+        groups: Vec<String>,
+        opts: NewServiceAccountOpts,
+        status: &str,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<OffsetDateTime> {
+        let mut credentials = build_service_account_credentials(parent_user, Some(groups), opts)?;
+        let preserve_existing_status = status.is_empty();
+        if !preserve_existing_status {
+            credentials.status = match status {
+                value if value == rustfs_madmin::AccountStatus::Enabled.as_ref() || value == ACCOUNT_ON => ACCOUNT_ON.to_string(),
+                _ => ACCOUNT_OFF.to_string(),
+            };
         }
-
-        if !policy_buf.is_empty() {
-            m.insert(
-                SESSION_POLICY_NAME.to_owned(),
-                Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
-            );
-            m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
-        } else {
-            m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
-        }
-
-        if let Some(claims) = opts.claims {
-            for (k, v) in claims.iter() {
-                if !m.contains_key(k) {
-                    m.insert(k.to_owned(), v.to_owned());
-                }
+        let access_key = credentials.access_key.clone();
+        let store = Arc::clone(&self.store);
+        let notify = !self.has_watcher();
+        tokio::spawn(async move {
+            let updated_at = store
+                .upsert_service_account(credentials, preserve_existing_status, incoming_updated_at)
+                .await?;
+            if notify {
+                notify_service_account(&access_key).await;
             }
-        }
-
-        if let Some(expiration) = opts.expiration {
-            m.insert("exp".to_string(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
-        }
-
-        let (access_key, secret_key) = if !opts.access_key.is_empty() || !opts.secret_key.is_empty() {
-            (opts.access_key, opts.secret_key)
-        } else {
-            generate_credentials()?
-        };
-
-        let mut cred = create_new_credentials_with_metadata(&access_key, &secret_key, &m, &secret_key)?;
-        cred.parent_user = parent_user.to_owned();
-        cred.groups = groups;
-        cred.status = ACCOUNT_ON.to_owned();
-        cred.name = opts.name;
-        cred.description = opts.description;
-
-        let create_at = self.store.add_service_account(cred.clone()).await?;
-
-        self.notify_for_service_account(&cred.access_key).await;
-
-        Ok((cred, create_at))
+            Ok(updated_at)
+        })
+        .await
+        .map_err(|err| IamError::other(format!("replicated service account upsert task failed: {err}")))?
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
@@ -537,11 +496,44 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::IAMActionNotAllowed);
         }
 
-        let updated_at = self.store.update_service_account(name, opts).await?;
+        let store = Arc::clone(&self.store);
+        let name = name.to_string();
+        let notify = !self.has_watcher();
+        tokio::spawn(async move {
+            let updated_at = store.update_service_account(&name, opts).await?;
+            if notify {
+                notify_service_account(&name).await;
+            }
+            Ok(updated_at)
+        })
+        .await
+        .map_err(|err| IamError::other(format!("service account update task failed: {err}")))?
+    }
 
-        self.notify_for_service_account(name).await;
+    pub async fn update_replicated_service_account(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<OffsetDateTime> {
+        if name == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
+            return Err(IamError::IAMActionNotAllowed);
+        }
 
-        Ok(updated_at)
+        let store = Arc::clone(&self.store);
+        let name = name.to_string();
+        let notify = !self.has_watcher();
+        tokio::spawn(async move {
+            let updated_at = store
+                .update_replicated_service_account(&name, opts, incoming_updated_at)
+                .await?;
+            if notify {
+                notify_service_account(&name).await;
+            }
+            Ok(updated_at)
+        })
+        .await
+        .map_err(|err| IamError::other(format!("replicated service account update task failed: {err}")))?
     }
 
     pub async fn list_service_accounts(&self, access_key: &str) -> Result<Vec<Credentials>> {
@@ -699,25 +691,41 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn delete_service_account_with_revision(&self, access_key: &str, notify: bool) -> Result<Option<OffsetDateTime>> {
-        let Some(u) = self.store.get_user(access_key).await else {
-            return Ok(None);
-        };
-
-        if !u.credentials.is_service_account() {
-            return Ok(None);
-        }
-
-        let deleted_at = self.store.delete_service_account_with_revision(access_key).await?;
-
-        if notify && !self.has_watcher() {
-            for result in notify_iam_load_service_account(access_key).await {
-                if let Some(err) = result.err {
-                    warn!("notify deleted service account failed: {}", err);
-                }
+        let store = Arc::clone(&self.store);
+        let access_key = access_key.to_string();
+        let notify = notify && !self.has_watcher();
+        tokio::spawn(async move {
+            let updated_at = store.tombstone_service_account(&access_key, None).await?;
+            if updated_at.is_some() && notify {
+                notify_service_account(&access_key).await;
             }
-        }
+            Ok(updated_at)
+        })
+        .await
+        .map_err(|err| IamError::other(format!("service account delete task failed: {err}")))?
+    }
 
-        Ok(Some(deleted_at))
+    pub async fn delete_replicated_service_account(
+        &self,
+        access_key: &str,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<()> {
+        let store = Arc::clone(&self.store);
+        let access_key = access_key.to_string();
+        let notify = !self.has_watcher();
+        tokio::spawn(async move {
+            if store
+                .tombstone_service_account(&access_key, incoming_updated_at)
+                .await?
+                .is_some()
+                && notify
+            {
+                notify_service_account(&access_key).await;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| IamError::other(format!("replicated service account delete task failed: {err}")))?
     }
 
     async fn notify_for_group(&self, group: &str) {
@@ -1599,6 +1607,74 @@ fn extract_session_policy_text(claims: &HashMap<String, Value>) -> Option<String
     String::from_utf8(bytes).ok()
 }
 
+fn build_service_account_credentials(
+    parent_user: &str,
+    groups: Option<Vec<String>>,
+    opts: NewServiceAccountOpts,
+) -> Result<Credentials> {
+    if parent_user.is_empty() {
+        return Err(IamError::InvalidArgument);
+    }
+    if !opts.access_key.is_empty() && opts.secret_key.is_empty() {
+        return Err(IamError::NoSecretKeyWithAccessKey);
+    }
+    if !opts.secret_key.is_empty() && opts.access_key.is_empty() {
+        return Err(IamError::NoAccessKeyWithSecretKey);
+    }
+    if parent_user == opts.access_key {
+        return Err(IamError::AccessKeyAlreadyExists);
+    }
+    if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
+        return Err(IamError::IAMActionNotAllowed);
+    }
+
+    let policy_buf = if let Some(policy) = opts.session_policy {
+        policy.validate()?;
+        let buf = serde_json::to_vec(&policy)?;
+        if buf.len() > MAX_SVCSESSION_POLICY_SIZE {
+            return Err(IamError::PolicyTooLarge);
+        }
+        buf
+    } else {
+        Vec::new()
+    };
+
+    let mut metadata = HashMap::from([("parent".to_owned(), Value::String(parent_user.to_owned()))]);
+    if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
+        metadata.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+    }
+    if policy_buf.is_empty() {
+        metadata.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
+    } else {
+        metadata.insert(
+            SESSION_POLICY_NAME.to_owned(),
+            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+        );
+        metadata.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
+    }
+    if let Some(claims) = opts.claims {
+        for (key, value) in claims {
+            metadata.entry(key).or_insert(value);
+        }
+    }
+    if let Some(expiration) = opts.expiration {
+        metadata.insert("exp".to_string(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
+    }
+
+    let (access_key, secret_key) = if !opts.access_key.is_empty() || !opts.secret_key.is_empty() {
+        (opts.access_key, opts.secret_key)
+    } else {
+        generate_credentials()?
+    };
+    let mut credentials = create_new_credentials_with_metadata(&access_key, &secret_key, &metadata, &secret_key)?;
+    credentials.parent_user = parent_user.to_owned();
+    credentials.groups = groups;
+    credentials.status = ACCOUNT_ON.to_owned();
+    credentials.name = opts.name;
+    credentials.description = opts.description;
+    Ok(credentials)
+}
+
 async fn evaluate_prepared_session_policy(policy: &PreparedSessionPolicy, args: &Args<'_>) -> Option<bool> {
     match policy {
         PreparedSessionPolicy::None => None,
@@ -1623,6 +1699,7 @@ pub struct NewServiceAccountOpts {
     pub claims: Option<HashMap<String, Value>>,
 }
 
+#[derive(Clone)]
 pub struct UpdateServiceAccountOpts {
     pub session_policy: Option<Policy>,
     pub secret_key: Option<String>,
@@ -1724,13 +1801,21 @@ mod tests {
   ]
 }"#;
 
+    type ServiceAccountSaveBarrier = Arc<Mutex<Option<(String, Arc<tokio::sync::Barrier>)>>>;
+
     /// Mock Store for STS tests: either group-attached policies via parent user, or no IAM policies.
     #[derive(Clone)]
     struct StsTestMockStore {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
+        saved_service_account_revisions: Arc<Mutex<HashMap<String, u64>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
+        blocked_service_account_save: ServiceAccountSaveBarrier,
+        blocked_after_service_account_save: ServiceAccountSaveBarrier,
+        blocked_after_user_load: ServiceAccountSaveBarrier,
+        saved_user_policies: Arc<Mutex<HashMap<String, MappedPolicy>>>,
+        blocked_after_mapped_policy_load: ServiceAccountSaveBarrier,
     }
 
     impl StsTestMockStore {
@@ -1738,7 +1823,13 @@ mod tests {
             Self {
                 empty_policies,
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
+                saved_service_account_revisions: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
+                blocked_service_account_save: Arc::new(Mutex::new(None)),
+                blocked_after_service_account_save: Arc::new(Mutex::new(None)),
+                blocked_after_user_load: Arc::new(Mutex::new(None)),
+                saved_user_policies: Arc::new(Mutex::new(HashMap::new())),
+                blocked_after_mapped_policy_load: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1747,6 +1838,43 @@ mod tests {
                 .saved_service_account_count
                 .lock()
                 .expect("saved_service_account_count mutex poisoned")
+        }
+
+        fn block_next_service_account_save(&self, access_key: &str) -> Arc<tokio::sync::Barrier> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *self
+                .blocked_service_account_save
+                .lock()
+                .expect("blocked_service_account_save mutex poisoned") = Some((access_key.to_string(), Arc::clone(&barrier)));
+            barrier
+        }
+
+        fn block_after_next_service_account_save(&self, access_key: &str) -> Arc<tokio::sync::Barrier> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *self
+                .blocked_after_service_account_save
+                .lock()
+                .expect("blocked_after_service_account_save mutex poisoned") =
+                Some((access_key.to_string(), Arc::clone(&barrier)));
+            barrier
+        }
+
+        fn block_after_next_user_load(&self, access_key: &str) -> Arc<tokio::sync::Barrier> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *self
+                .blocked_after_user_load
+                .lock()
+                .expect("blocked_after_user_load mutex poisoned") = Some((access_key.to_string(), Arc::clone(&barrier)));
+            barrier
+        }
+
+        fn block_after_next_mapped_policy_load(&self, name: &str) -> Arc<tokio::sync::Barrier> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *self
+                .blocked_after_mapped_policy_load
+                .lock()
+                .expect("blocked_after_mapped_policy_load mutex poisoned") = Some((name.to_string(), Arc::clone(&barrier)));
+            barrier
         }
     }
 
@@ -1780,6 +1908,31 @@ mod tests {
                     .saved_service_account_count
                     .lock()
                     .expect("saved_service_account_count mutex poisoned") += 1;
+                let barrier = {
+                    let mut blocked = self
+                        .blocked_service_account_save
+                        .lock()
+                        .expect("blocked_service_account_save mutex poisoned");
+                    if blocked.as_ref().is_some_and(|(access_key, _)| access_key == name) {
+                        blocked.take().map(|(_, barrier)| barrier)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                let mut revisions = self
+                    .saved_service_account_revisions
+                    .lock()
+                    .expect("saved_service_account_revisions mutex poisoned");
+                self.saved_sts_users
+                    .lock()
+                    .expect("saved_sts_users mutex poisoned")
+                    .insert(name.to_string(), item);
+                *revisions.entry(name.to_string()).or_default() += 1;
+                return Ok(());
             }
             self.saved_sts_users
                 .lock()
@@ -1788,7 +1941,115 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_user_identity(&self, name: &str, _user_type: UserType) -> Result<()> {
+        async fn load_user_identity_versioned(&self, name: &str, user_type: UserType) -> Result<(UserIdentity, Option<String>)> {
+            if user_type != UserType::Svc {
+                return self
+                    .load_user_identity(name, user_type)
+                    .await
+                    .map(|identity| (identity, None));
+            }
+            let identity = self
+                .saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
+            let revision = self
+                .saved_service_account_revisions
+                .lock()
+                .expect("saved_service_account_revisions mutex poisoned")
+                .get(name)
+                .copied()
+                .map(|revision| revision.to_string());
+            Ok((identity, revision))
+        }
+
+        async fn save_user_identity_if_version(
+            &self,
+            name: &str,
+            user_type: UserType,
+            item: UserIdentity,
+            expected_version: Option<&str>,
+        ) -> Result<bool> {
+            if user_type != UserType::Svc {
+                return Err(Error::InvalidArgument);
+            }
+            *self
+                .saved_service_account_count
+                .lock()
+                .expect("saved_service_account_count mutex poisoned") += 1;
+            let barrier = {
+                let mut blocked = self
+                    .blocked_service_account_save
+                    .lock()
+                    .expect("blocked_service_account_save mutex poisoned");
+                if blocked.as_ref().is_some_and(|(access_key, _)| access_key == name) {
+                    blocked.take().map(|(_, barrier)| barrier)
+                } else {
+                    None
+                }
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            let after_save_barrier = {
+                let mut blocked = self
+                    .blocked_after_service_account_save
+                    .lock()
+                    .expect("blocked_after_service_account_save mutex poisoned");
+                if blocked.as_ref().is_some_and(|(access_key, _)| access_key == name) {
+                    blocked.take().map(|(_, barrier)| barrier)
+                } else {
+                    None
+                }
+            };
+
+            {
+                let mut revisions = self
+                    .saved_service_account_revisions
+                    .lock()
+                    .expect("saved_service_account_revisions mutex poisoned");
+                let current = revisions.get(name).copied();
+                let expected = expected_version.map(str::parse::<u64>).transpose().map_err(Error::other)?;
+                if expected != current {
+                    return Ok(false);
+                }
+                self.saved_sts_users
+                    .lock()
+                    .expect("saved_sts_users mutex poisoned")
+                    .insert(name.to_string(), item);
+                revisions.insert(name.to_string(), current.unwrap_or_default() + 1);
+            }
+            if let Some(barrier) = after_save_barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            Ok(true)
+        }
+
+        async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
+            if user_type == UserType::Svc {
+                self.saved_sts_users
+                    .lock()
+                    .expect("saved_sts_users mutex poisoned")
+                    .remove(name);
+                self.saved_service_account_revisions
+                    .lock()
+                    .expect("saved_service_account_revisions mutex poisoned")
+                    .remove(name);
+                return Ok(());
+            }
+            if user_type == UserType::Sts
+                && self
+                    .saved_service_account_revisions
+                    .lock()
+                    .expect("saved_service_account_revisions mutex poisoned")
+                    .contains_key(name)
+            {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
             self.saved_sts_users
                 .lock()
                 .expect("saved_sts_users mutex poisoned")
@@ -1796,18 +2057,68 @@ mod tests {
             Ok(())
         }
 
-        async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
+        async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity> {
+            let is_service_account = self
+                .saved_service_account_revisions
+                .lock()
+                .expect("saved_service_account_revisions mutex poisoned")
+                .contains_key(name);
+            if user_type == UserType::Reg
+                || user_type == UserType::Svc && !is_service_account
+                || user_type == UserType::Sts && is_service_account
+            {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
             self.saved_sts_users
                 .lock()
                 .expect("saved_sts_users mutex poisoned")
                 .get(name)
                 .cloned()
+                .filter(|identity| !crate::store::is_service_account_replication_tombstone(identity))
                 .ok_or_else(|| Error::NoSuchUser(name.to_string()))
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
             if name == "deleted-notify-user" {
                 return Err(Error::NoSuchUser(name.to_string()));
+            }
+
+            if matches!(user_type, UserType::Svc | UserType::Sts) {
+                let is_service_account = self
+                    .saved_service_account_revisions
+                    .lock()
+                    .expect("saved_service_account_revisions mutex poisoned")
+                    .contains_key(name);
+                if user_type == UserType::Svc && !is_service_account || user_type == UserType::Sts && is_service_account {
+                    return Err(Error::NoSuchUser(name.to_string()));
+                }
+                let identity = self
+                    .saved_sts_users
+                    .lock()
+                    .expect("saved_sts_users mutex poisoned")
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
+                if crate::store::is_service_account_replication_tombstone(&identity) {
+                    return Err(Error::NoSuchUser(name.to_string()));
+                }
+                m.insert(name.to_string(), identity);
+                let barrier = {
+                    let mut blocked = self
+                        .blocked_after_user_load
+                        .lock()
+                        .expect("blocked_after_user_load mutex poisoned");
+                    if blocked.as_ref().is_some_and(|(access_key, _)| access_key == name) {
+                        blocked.take().map(|(_, barrier)| barrier)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                return Ok(());
             }
 
             if user_type == UserType::Reg && name == "load-failure-user" {
@@ -1826,7 +2137,25 @@ mod tests {
             Ok(())
         }
 
-        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+        async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            let identities = self.saved_sts_users.lock().expect("saved_sts_users mutex poisoned").clone();
+            let service_account_revisions = self
+                .saved_service_account_revisions
+                .lock()
+                .expect("saved_service_account_revisions mutex poisoned")
+                .clone();
+            for (access_key, identity) in identities {
+                let is_service_account = service_account_revisions.contains_key(&access_key);
+                let matches_type = match user_type {
+                    UserType::Svc => is_service_account && !crate::store::is_service_account_replication_tombstone(&identity),
+                    UserType::Sts => !is_service_account && identity.credentials.is_temp(),
+                    UserType::Reg => !is_service_account && !identity.credentials.is_temp(),
+                    UserType::None => false,
+                };
+                if matches_type {
+                    m.insert(access_key, identity);
+                }
+            }
             Ok(())
         }
 
@@ -1875,16 +2204,30 @@ mod tests {
 
         async fn save_mapped_policy(
             &self,
-            _name: &str,
-            _user_type: UserType,
-            _is_group: bool,
-            _item: MappedPolicy,
+            name: &str,
+            user_type: UserType,
+            is_group: bool,
+            item: MappedPolicy,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            if user_type == UserType::Reg && !is_group {
+                self.saved_user_policies
+                    .lock()
+                    .expect("saved_user_policies mutex poisoned")
+                    .insert(name.to_string(), item);
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
-        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
+            if user_type == UserType::Reg && !is_group {
+                self.saved_user_policies
+                    .lock()
+                    .expect("saved_user_policies mutex poisoned")
+                    .remove(name);
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -1895,6 +2238,34 @@ mod tests {
             is_group: bool,
             m: &mut HashMap<String, MappedPolicy>,
         ) -> Result<()> {
+            let saved_policy = if user_type == UserType::Reg && !is_group {
+                self.saved_user_policies
+                    .lock()
+                    .expect("saved_user_policies mutex poisoned")
+                    .get(name)
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(policy) = saved_policy {
+                m.insert(name.to_string(), policy);
+                let barrier = {
+                    let mut blocked = self
+                        .blocked_after_mapped_policy_load
+                        .lock()
+                        .expect("blocked_after_mapped_policy_load mutex poisoned");
+                    if blocked.as_ref().is_some_and(|(policy_name, _)| policy_name == name) {
+                        blocked.take().map(|(_, barrier)| barrier)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                return Ok(());
+            }
             if user_type == UserType::Reg && !is_group && name == "notify-user" {
                 m.insert(name.to_string(), MappedPolicy::new("readwrite"));
             }
@@ -1918,6 +2289,30 @@ mod tests {
             let custom_claim_policy =
                 Policy::parse_config(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes()).expect("custom STS claim policy should parse");
             policy_docs.insert(CUSTOM_STS_CLAIM_POLICY.to_string(), PolicyDoc::new(custom_claim_policy));
+            let saved_identities = self.saved_sts_users.lock().expect("saved_sts_users mutex poisoned").clone();
+            let service_account_revisions = self
+                .saved_service_account_revisions
+                .lock()
+                .expect("saved_service_account_revisions mutex poisoned")
+                .clone();
+            let mut persisted_users = HashMap::new();
+            let mut persisted_sts_accounts = HashMap::new();
+            for (access_key, identity) in saved_identities {
+                if service_account_revisions.contains_key(&access_key) {
+                    if !crate::store::is_service_account_replication_tombstone(&identity) {
+                        persisted_users.insert(access_key, identity);
+                    }
+                } else if identity.credentials.is_temp() {
+                    persisted_sts_accounts.insert(access_key, identity);
+                } else {
+                    persisted_users.insert(access_key, identity);
+                }
+            }
+            let persisted_user_policies = self
+                .saved_user_policies
+                .lock()
+                .expect("saved_user_policies mutex poisoned")
+                .clone();
 
             if self.empty_policies {
                 const PARENT_USER: &str = "sts-empty-parent-policy-test";
@@ -1938,7 +2333,7 @@ mod tests {
                     credentials: creds,
                     update_at: Some(OffsetDateTime::now_utc()),
                 };
-                let mut users = HashMap::new();
+                let mut users = persisted_users;
                 users.insert(PARENT_USER.to_string(), parent_identity);
 
                 cache.with_write_lock(|cache| {
@@ -1946,8 +2341,8 @@ mod tests {
                     cache.replace_users(CacheEntity::new(users));
                     cache.replace_groups(CacheEntity::default());
                     cache.replace_group_policies(CacheEntity::default());
-                    cache.replace_user_policies(CacheEntity::default());
-                    cache.replace_sts_accounts(CacheEntity::default());
+                    cache.replace_user_policies(CacheEntity::new(persisted_user_policies));
+                    cache.replace_sts_accounts(CacheEntity::new(persisted_sts_accounts));
                     cache.replace_sts_policies(CacheEntity::default());
                     cache.build_user_group_memberships();
                 });
@@ -1974,7 +2369,7 @@ mod tests {
                 credentials: creds,
                 update_at: Some(OffsetDateTime::now_utc()),
             };
-            let mut users = HashMap::new();
+            let mut users = persisted_users;
             users.insert(PARENT_USER.to_string(), parent_identity);
 
             let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
@@ -1990,8 +2385,8 @@ mod tests {
                 cache.replace_users(CacheEntity::new(users));
                 cache.replace_groups(CacheEntity::new(groups));
                 cache.replace_group_policies(CacheEntity::new(group_policies));
-                cache.replace_user_policies(CacheEntity::default());
-                cache.replace_sts_accounts(CacheEntity::default());
+                cache.replace_user_policies(CacheEntity::new(persisted_user_policies));
+                cache.replace_sts_accounts(CacheEntity::new(persisted_sts_accounts));
                 cache.replace_sts_policies(CacheEntity::default());
                 cache.build_user_group_memberships();
             });
@@ -2018,6 +2413,18 @@ mod tests {
             secret_key: secret_key.to_string(),
             ..Default::default()
         }
+    }
+
+    fn replicated_oidc_claims(parent_user: &str, policy: &str) -> HashMap<String, Value> {
+        HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String(policy.to_string())),
+            (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
+        ])
     }
 
     #[tokio::test]
@@ -2232,7 +2639,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.unwrap();
+        let cache_manager = IamCache::new(store.clone()).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let (cred, _) = iam_sys
@@ -3168,6 +3575,1247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replicated_oidc_service_account_replaces_complete_authorization_state() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "openid=replicated-oidc-parent";
+        let access_key = "REPLICATEDOIDCSVC001";
+        let wide_claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+            (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
+        ]);
+        iam_sys
+            .new_service_account(
+                parent_user,
+                Some(vec!["old-group".to_string()]),
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "replicatedOidcOldSecret123".to_string(),
+                    claims: Some(wide_claims),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial replicated service account should be created");
+        let source_updated_at = OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        iam_sys
+            .update_service_account(
+                access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: Some(
+                        Policy::parse_config(
+                            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*","arn:aws:s3:::*/*"]}]}"#,
+                        )
+                        .expect("deny policy should parse"),
+                    ),
+                    secret_key: Some("replicatedOidcNewSecret123".to_string()),
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: Some(STATUS_DISABLED.to_string()),
+                    allow_site_replicator_account: false,
+                },
+            )
+            .await
+            .expect("target-local disabled status should be stored");
+        let guarded = iam_sys
+            .get_user(access_key)
+            .await
+            .expect("guarded service account should be cached");
+        let guarded_claims = guarded.credentials.claims.as_ref().expect("guarded claims should decode");
+        assert!(extract_session_policy_text(guarded_claims).is_some());
+        let guarded_args = Args {
+            account: access_key,
+            groups: &guarded.credentials.groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: guarded_claims,
+            deny_only: false,
+        };
+        assert!(
+            !iam_sys.is_allowed(&guarded_args).await,
+            "an older receiver must fail closed instead of retaining a wider OIDC grant"
+        );
+
+        let narrow_claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string())),
+            (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
+        ]);
+        iam_sys
+            .upsert_replicated_service_account(
+                parent_user,
+                vec!["new-group".to_string()],
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "replicatedOidcNewSecret123".to_string(),
+                    claims: Some(narrow_claims),
+                    ..Default::default()
+                },
+                "",
+                Some(source_updated_at),
+            )
+            .await
+            .expect("replicated service account should be replaced in one write");
+
+        let stored = iam_sys
+            .get_user(access_key)
+            .await
+            .expect("replicated account should be cached");
+        assert_eq!(stored.credentials.secret_key, "replicatedOidcNewSecret123");
+        assert_eq!(stored.credentials.groups, Some(vec!["new-group".to_string()]));
+        assert_eq!(stored.credentials.status, ACCOUNT_OFF);
+        let claims = stored.credentials.claims.as_ref().expect("replicated claims should decode");
+        assert_eq!(claims.get(POLICYNAME).and_then(Value::as_str), Some(CUSTOM_STS_CLAIM_POLICY));
+        let groups = stored.credentials.groups.clone();
+        let conditions = HashMap::new();
+        for (action, allowed) in [(S3Action::GetObjectAction, true), (S3Action::PutObjectAction, false)] {
+            let args = Args {
+                account: access_key,
+                groups: &groups,
+                action: Action::S3Action(action),
+                bucket: CUSTOM_STS_CLAIM_BUCKET,
+                conditions: &conditions,
+                is_owner: false,
+                object: "allowed/object.txt",
+                claims,
+                deny_only: false,
+            };
+            assert_eq!(
+                iam_sys.is_allowed(&args).await,
+                allowed,
+                "replication must not retain the previous wider OIDC grant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replicated_service_account_cannot_replace_other_identity_types_or_parent() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+
+        let regular_access_key = "sts-fallback-test-parent";
+        let regular_result = iam_sys
+            .upsert_replicated_service_account(
+                "replication-parent",
+                Vec::new(),
+                service_account_opts(regular_access_key, "replicatedRegularCollisionSecret"),
+                STATUS_ENABLED,
+                None,
+            )
+            .await;
+        assert!(matches!(regular_result, Err(IamError::AccessKeyAlreadyExists)));
+        let regular = iam_sys.get_user(regular_access_key).await.expect("regular user must remain");
+        assert!(!regular.credentials.is_service_account());
+
+        let sts_access_key = "REPLICATIONSTSKEY01";
+        let sts = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "replicationStsSecret123".to_string(),
+            session_token: "sts-session".to_string(),
+            parent_user: "sts-parent".to_string(),
+            ..Default::default()
+        });
+        iam_sys
+            .store
+            .api
+            .save_user_identity(sts_access_key, UserType::Sts, sts.clone(), None)
+            .await
+            .expect("STS identity should be persisted");
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts, OffsetDateTime::now_utc());
+        let sts_result = iam_sys
+            .upsert_replicated_service_account(
+                "replication-parent",
+                Vec::new(),
+                service_account_opts(sts_access_key, "replicatedStsCollisionSecret"),
+                STATUS_ENABLED,
+                None,
+            )
+            .await;
+        assert!(matches!(sts_result, Err(IamError::AccessKeyAlreadyExists)));
+        let cached_sts = iam_sys.store.cache.snapshot();
+        assert_eq!(
+            cached_sts
+                .sts_accounts
+                .get(sts_access_key)
+                .expect("STS identity must remain")
+                .credentials
+                .parent_user,
+            "sts-parent"
+        );
+        drop(cached_sts);
+
+        let service_access_key = "REPLICATIONSERVICE01";
+        iam_sys
+            .new_service_account(
+                "original-parent",
+                None,
+                service_account_opts(service_access_key, "originalServiceSecret123"),
+            )
+            .await
+            .expect("initial service account should be created");
+        let reparent_result = iam_sys
+            .upsert_replicated_service_account(
+                "different-parent",
+                Vec::new(),
+                service_account_opts(service_access_key, "replacementServiceSecret123"),
+                STATUS_ENABLED,
+                None,
+            )
+            .await;
+        assert!(matches!(reparent_result, Err(IamError::AccessKeyAlreadyExists)));
+        let service = iam_sys
+            .get_user(service_access_key)
+            .await
+            .expect("original service account must remain");
+        assert_eq!(service.credentials.parent_user, "original-parent");
+        assert_eq!(service.credentials.secret_key, "originalServiceSecret123");
+    }
+
+    #[tokio::test]
+    async fn service_account_create_is_atomic_across_iam_caches() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let first = IamSys::new(IamCache::new(store.clone()).await.expect("first IAM cache should initialize"));
+        let second = IamSys::new(
+            IamCache::new(store.clone())
+                .await
+                .expect("second IAM cache should initialize"),
+        );
+        let access_key = "CROSSNODECREATE0001";
+
+        let (first_result, second_result) = tokio::join!(
+            first.new_service_account("openid=first-parent", None, service_account_opts(access_key, "crossNodeFirstSecret123"),),
+            second.new_service_account(
+                "openid=second-parent",
+                None,
+                service_account_opts(access_key, "crossNodeSecondSecret123"),
+            )
+        );
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let persisted = store
+            .load_user_identity(access_key, UserType::Svc)
+            .await
+            .expect("one service account should be persisted");
+        assert!(["crossNodeFirstSecret123", "crossNodeSecondSecret123"].contains(&persisted.credentials.secret_key.as_str()));
+    }
+
+    #[tokio::test]
+    async fn local_delete_tombstone_rejects_delayed_create_and_allows_explicit_recreate() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize"));
+        let parent_user = "openid=delete-fence-parent";
+        let access_key = "DELETEFENCEACCOUNT01";
+        iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "deleteFenceInitialSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        let future_revision = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+        iam_sys
+            .upsert_replicated_service_account(
+                parent_user,
+                Vec::new(),
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "deleteFenceInitialSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+                STATUS_ENABLED,
+                Some(future_revision),
+            )
+            .await
+            .expect("future-dated replicated state should be stored");
+
+        let deleted_at = iam_sys
+            .delete_service_account_with_revision(access_key, false)
+            .await
+            .expect("local delete should succeed")
+            .expect("local delete should create a fence");
+        assert!(deleted_at > future_revision);
+        let cached_after_delete = iam_sys.get_user(access_key).await;
+        assert!(cached_after_delete.is_none(), "cached identity after delete: {cached_after_delete:?}");
+        let tombstone = store
+            .load_user_identity_versioned(access_key, UserType::Svc)
+            .await
+            .expect("delete fence should be persisted")
+            .0;
+        assert!(crate::store::is_service_account_replication_tombstone(&tombstone));
+
+        iam_sys
+            .upsert_replicated_service_account(
+                parent_user,
+                Vec::new(),
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "deleteFenceDelayedSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+                STATUS_ENABLED,
+                Some(deleted_at - time::Duration::nanoseconds(1)),
+            )
+            .await
+            .expect("delayed create should be ignored");
+        assert!(iam_sys.get_user(access_key).await.is_none());
+
+        let (recreated, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "deleteFenceRecreatedSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, CUSTOM_STS_CLAIM_POLICY)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an explicit local recreate should replace the tombstone");
+        assert_eq!(recreated.secret_key, "deleteFenceRecreatedSecret");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_delete_tombstones_durable_service_account() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let access_key = "CACHEMISSDELETE0001";
+        let iam_sys = IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize"));
+        let credentials = build_service_account_credentials(
+            "openid=cache-miss-parent",
+            None,
+            service_account_opts(access_key, "cacheMissDeleteSecret123"),
+        )
+        .expect("service account credentials should build");
+        store
+            .save_user_identity(access_key, UserType::Svc, UserIdentity::new(credentials), None)
+            .await
+            .expect("service account should be persisted without populating IAM cache");
+        assert!(!iam_sys.store.cache.snapshot().users.contains_key(access_key));
+
+        let deleted_at = iam_sys
+            .delete_service_account_with_revision(access_key, false)
+            .await
+            .expect("cache-miss delete should succeed");
+
+        assert!(deleted_at.is_some());
+        let persisted = store
+            .load_user_identity_versioned(access_key, UserType::Svc)
+            .await
+            .expect("delete fence should remain durable")
+            .0;
+        assert!(crate::store::is_service_account_replication_tombstone(&persisted));
+    }
+
+    #[tokio::test]
+    async fn cancelled_update_still_publishes_committed_identity_to_cache() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize")));
+        let access_key = "CANCELSAFEUPDATE001";
+        iam_sys
+            .new_service_account(
+                "openid=cancel-safe-parent",
+                None,
+                service_account_opts(access_key, "cancelSafeInitialSecret"),
+            )
+            .await
+            .expect("initial service account should be created");
+        let barrier = store.block_after_next_service_account_save(access_key);
+
+        let update = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: Some("cancelSafeCommittedSecret".to_string()),
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            allow_site_replicator_account: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        update.abort();
+        barrier.wait().await;
+
+        for _ in 0..1000 {
+            if iam_sys
+                .get_user(access_key)
+                .await
+                .is_some_and(|identity| identity.credentials.secret_key == "cancelSafeCommittedSecret")
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("committed service account update was not published after caller cancellation");
+    }
+
+    #[tokio::test]
+    async fn stale_identity_notification_cannot_restore_a_deleted_service_account() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize")));
+        let access_key = "STALEIDENTITYNOTICE1";
+        let credentials = build_service_account_credentials(
+            "openid=stale-notification-parent",
+            None,
+            service_account_opts(access_key, "staleNotificationSecret"),
+        )
+        .expect("service account credentials should build");
+        store
+            .save_user_identity(access_key, UserType::Svc, UserIdentity::new(credentials), None)
+            .await
+            .expect("service account should be persisted");
+        assert!(!iam_sys.store.cache.snapshot().users.contains_key(access_key));
+
+        let barrier = store.block_after_next_user_load(access_key);
+        let refresh = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move { iam_sys.store.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        barrier.wait().await;
+        store
+            .delete_user_identity(access_key, UserType::Svc)
+            .await
+            .expect("service account should be deleted while the stale read is paused");
+        iam_sys.store.cache.delete_user(access_key, OffsetDateTime::now_utc());
+        barrier.wait().await;
+        refresh
+            .await
+            .expect("notification task should complete")
+            .expect("notification handler should succeed");
+
+        assert!(
+            !iam_sys.store.cache.snapshot().users.contains_key(access_key),
+            "a stale found result must not restore a deleted credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_identity_update_does_not_drop_a_new_service_account_notification() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize")));
+        let access_key = "NEWIDENTITYNOTICE01";
+        let credentials = build_service_account_credentials(
+            "openid=new-notification-parent",
+            None,
+            service_account_opts(access_key, "newNotificationSecret"),
+        )
+        .expect("service account credentials should build");
+        store
+            .save_user_identity(access_key, UserType::Svc, UserIdentity::new(credentials), None)
+            .await
+            .expect("service account should be persisted");
+
+        let barrier = store.block_after_next_user_load(access_key);
+        let refresh = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move { iam_sys.store.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        barrier.wait().await;
+        iam_sys.store.cache.add_or_update_user(
+            "unrelated-user",
+            &UserIdentity::from(Credentials {
+                access_key: "unrelated-user".to_string(),
+                secret_key: "unrelatedUserSecret".to_string(),
+                status: ACCOUNT_ON.to_string(),
+                ..Default::default()
+            }),
+            OffsetDateTime::now_utc(),
+        );
+        barrier.wait().await;
+        refresh
+            .await
+            .expect("notification task should complete")
+            .expect("notification handler should retry successfully");
+
+        assert!(
+            iam_sys.get_user(access_key).await.is_some(),
+            "an unrelated cache write must not drop a new credential notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_mapping_notification_cannot_restore_a_deleted_policy_mapping() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize")));
+        let name = "stale-mapping-notification";
+        store
+            .save_mapped_policy(name, UserType::Reg, false, MappedPolicy::new("readwrite"), None)
+            .await
+            .expect("mapping should be persisted");
+        assert!(!iam_sys.store.cache.snapshot().user_policies.contains_key(name));
+
+        let barrier = store.block_after_next_mapped_policy_load(name);
+        let refresh = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .store
+                    .policy_mapping_notification_handler(name, UserType::Reg, false)
+                    .await
+            })
+        };
+        barrier.wait().await;
+        store
+            .delete_mapped_policy(name, UserType::Reg, false)
+            .await
+            .expect("mapping should be deleted while the stale read is paused");
+        iam_sys.store.cache.delete_user_policy(name, OffsetDateTime::now_utc());
+        barrier.wait().await;
+        refresh
+            .await
+            .expect("notification task should complete")
+            .expect("notification handler should succeed");
+
+        assert!(
+            !iam_sys.store.cache.snapshot().user_policies.contains_key(name),
+            "a stale found result must not restore a deleted mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_mapping_update_does_not_drop_a_new_policy_mapping_notification() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM cache should initialize")));
+        let name = "new-mapping-notification";
+        store
+            .save_mapped_policy(name, UserType::Reg, false, MappedPolicy::new("readwrite"), None)
+            .await
+            .expect("mapping should be persisted");
+
+        let barrier = store.block_after_next_mapped_policy_load(name);
+        let refresh = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .store
+                    .policy_mapping_notification_handler(name, UserType::Reg, false)
+                    .await
+            })
+        };
+        barrier.wait().await;
+        iam_sys.store.cache.add_or_update_user_policy(
+            "unrelated-mapping",
+            &MappedPolicy::new("readonly"),
+            OffsetDateTime::now_utc(),
+        );
+        barrier.wait().await;
+        refresh
+            .await
+            .expect("notification task should complete")
+            .expect("notification handler should retry successfully");
+
+        assert_eq!(
+            iam_sys
+                .store
+                .cache
+                .snapshot()
+                .user_policies
+                .get(name)
+                .map(|mapping| mapping.policies.as_str()),
+            Some("readwrite")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_older_replication_cannot_restore_wider_oidc_claims() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let store_control = store.clone();
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store).await.expect("IAM cache should initialize")));
+        let parent_user = "openid=concurrent-replication-parent";
+        let access_key = "CONCURRENTOIDCSVC001";
+        iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "concurrentInitialSecret123".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        let base_updated_at = iam_sys
+            .get_user(access_key)
+            .await
+            .and_then(|user| user.update_at)
+            .expect("initial update timestamp should exist");
+        let barrier = store_control.block_next_service_account_save(access_key);
+
+        let newer = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .upsert_replicated_service_account(
+                        parent_user,
+                        Vec::new(),
+                        NewServiceAccountOpts {
+                            access_key: access_key.to_string(),
+                            secret_key: "concurrentNarrowSecret123".to_string(),
+                            claims: Some(replicated_oidc_claims(parent_user, CUSTOM_STS_CLAIM_POLICY)),
+                            ..Default::default()
+                        },
+                        STATUS_ENABLED,
+                        Some(base_updated_at + time::Duration::nanoseconds(2)),
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let older = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .upsert_replicated_service_account(
+                        parent_user,
+                        Vec::new(),
+                        NewServiceAccountOpts {
+                            access_key: access_key.to_string(),
+                            secret_key: "concurrentWideSecret123".to_string(),
+                            claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                            ..Default::default()
+                        },
+                        STATUS_ENABLED,
+                        Some(base_updated_at + time::Duration::nanoseconds(1)),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
+        newer
+            .await
+            .expect("newer replication task should complete")
+            .expect("newer replication should succeed");
+        older
+            .await
+            .expect("older replication task should complete")
+            .expect("older replication should be ignored");
+
+        let stored = iam_sys.get_user(access_key).await.expect("service account should remain");
+        let claims = stored.credentials.claims.as_ref().expect("claims should decode");
+        assert_eq!(claims.get(POLICYNAME).and_then(Value::as_str), Some(CUSTOM_STS_CLAIM_POLICY));
+        assert_eq!(stored.credentials.secret_key, "concurrentNarrowSecret123");
+        assert_eq!(stored.update_at, Some(base_updated_at + time::Duration::nanoseconds(2)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_local_disable_wins_over_empty_status_replication() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let store_control = store.clone();
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store).await.expect("IAM cache should initialize")));
+        let parent_user = "openid=concurrent-disable-parent";
+        let access_key = "CONCURRENTDISABLE001";
+        iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "concurrentDisableOldSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        let base_updated_at = iam_sys
+            .get_user(access_key)
+            .await
+            .and_then(|user| user.update_at)
+            .expect("initial update timestamp should exist");
+        let barrier = store_control.block_next_service_account_save(access_key);
+
+        let replication = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .upsert_replicated_service_account(
+                        parent_user,
+                        Vec::new(),
+                        NewServiceAccountOpts {
+                            access_key: access_key.to_string(),
+                            secret_key: "concurrentDisableNewSecret".to_string(),
+                            claims: Some(replicated_oidc_claims(parent_user, CUSTOM_STS_CLAIM_POLICY)),
+                            ..Default::default()
+                        },
+                        "",
+                        Some(base_updated_at + time::Duration::nanoseconds(1)),
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let disable = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: None,
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: Some(STATUS_DISABLED.to_string()),
+                            allow_site_replicator_account: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        for _ in 0..1000 {
+            if store_control.saved_service_account_count() >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        barrier.wait().await;
+        replication
+            .await
+            .expect("replication task should complete")
+            .expect("replication should succeed");
+        disable
+            .await
+            .expect("disable task should complete")
+            .expect("disable should succeed");
+
+        let stored = iam_sys.get_user(access_key).await.expect("service account should remain");
+        let claims = stored.credentials.claims.as_ref().expect("claims should decode");
+        assert_eq!(stored.credentials.status, ACCOUNT_OFF);
+        assert_eq!(stored.credentials.secret_key, "concurrentDisableNewSecret");
+        assert_eq!(claims.get(POLICYNAME).and_then(Value::as_str), Some(CUSTOM_STS_CLAIM_POLICY));
+    }
+
+    #[tokio::test]
+    async fn older_replicated_update_cannot_overwrite_newer_complete_state() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let store_control = store.clone();
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store).await.expect("IAM cache should initialize")));
+        let parent_user = "openid=replicated-update-parent";
+        let access_key = "REPLICATEDUPDATE001";
+        iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "replicatedUpdateInitialSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        let base_updated_at = iam_sys
+            .get_user(access_key)
+            .await
+            .and_then(|user| user.update_at)
+            .expect("initial update timestamp should exist");
+        let barrier = store_control.block_next_service_account_save(access_key);
+
+        let newer = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .upsert_replicated_service_account(
+                        parent_user,
+                        Vec::new(),
+                        NewServiceAccountOpts {
+                            access_key: access_key.to_string(),
+                            secret_key: "replicatedUpdateNewSecret".to_string(),
+                            claims: Some(replicated_oidc_claims(parent_user, CUSTOM_STS_CLAIM_POLICY)),
+                            ..Default::default()
+                        },
+                        STATUS_ENABLED,
+                        Some(base_updated_at + time::Duration::nanoseconds(2)),
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let older = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .update_replicated_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: Some("replicatedUpdateOldSecret".to_string()),
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            allow_site_replicator_account: false,
+                        },
+                        Some(base_updated_at + time::Duration::nanoseconds(1)),
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        newer
+            .await
+            .expect("newer replication task should complete")
+            .expect("newer replication should succeed");
+        older
+            .await
+            .expect("older update task should complete")
+            .expect("older update should be ignored");
+
+        let stored = iam_sys.get_user(access_key).await.expect("service account should remain");
+        assert_eq!(stored.credentials.secret_key, "replicatedUpdateNewSecret");
+        assert_eq!(stored.update_at, Some(base_updated_at + time::Duration::nanoseconds(2)));
+    }
+
+    #[tokio::test]
+    async fn older_replicated_delete_cannot_remove_newer_complete_state() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let store_control = store.clone();
+        let iam_sys = Arc::new(IamSys::new(IamCache::new(store).await.expect("IAM cache should initialize")));
+        let parent_user = "openid=replicated-delete-parent";
+        let access_key = "REPLICATEDDELETE001";
+        iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "replicatedDeleteInitialSecret".to_string(),
+                    claims: Some(replicated_oidc_claims(parent_user, "readwrite")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        let base_updated_at = iam_sys
+            .get_user(access_key)
+            .await
+            .and_then(|user| user.update_at)
+            .expect("initial update timestamp should exist");
+        let barrier = store_control.block_next_service_account_save(access_key);
+
+        let newer = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .upsert_replicated_service_account(
+                        parent_user,
+                        Vec::new(),
+                        NewServiceAccountOpts {
+                            access_key: access_key.to_string(),
+                            secret_key: "replicatedDeleteNewSecret".to_string(),
+                            claims: Some(replicated_oidc_claims(parent_user, CUSTOM_STS_CLAIM_POLICY)),
+                            ..Default::default()
+                        },
+                        STATUS_ENABLED,
+                        Some(base_updated_at + time::Duration::nanoseconds(2)),
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let older = {
+            let iam_sys = Arc::clone(&iam_sys);
+            tokio::spawn(async move {
+                iam_sys
+                    .delete_replicated_service_account(access_key, Some(base_updated_at + time::Duration::nanoseconds(1)))
+                    .await
+            })
+        };
+        barrier.wait().await;
+        newer
+            .await
+            .expect("newer replication task should complete")
+            .expect("newer replication should succeed");
+        older
+            .await
+            .expect("older delete task should complete")
+            .expect("older delete should be ignored");
+
+        let stored = iam_sys.get_user(access_key).await.expect("service account should remain");
+        assert_eq!(stored.credentials.secret_key, "replicatedDeleteNewSecret");
+        assert_eq!(stored.update_at, Some(base_updated_at + time::Duration::nanoseconds(2)));
+    }
+
+    #[tokio::test]
+    async fn verified_oidc_sts_uses_claim_policy_without_parent_mapping() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "virtual-parent";
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_policy(parent_user, &MappedPolicy::new("readwrite"), OffsetDateTime::now_utc());
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string())),
+        ]);
+        for (action, allowed) in [(S3Action::GetObjectAction, true), (S3Action::PutObjectAction, false)] {
+            let args = Args {
+                account: "oidc-sts-access-key",
+                groups: &None,
+                action: Action::S3Action(action),
+                bucket: CUSTOM_STS_CLAIM_BUCKET,
+                conditions: &HashMap::new(),
+                is_owner: false,
+                object: "allowed/object.txt",
+                claims: &claims,
+                deny_only: false,
+            };
+            let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+
+            assert_eq!(iam_sys.eval_prepared(&prepared, &args).await, allowed);
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_oidc_sts_partially_missing_policy_fails_closed() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "virtual-parent";
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite,missing-policy".to_string())),
+        ]);
+        let args = Args {
+            account: "oidc-sts-access-key",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+
+        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+        assert!(!iam_sys.eval_prepared(&prepared, &args).await);
+    }
+
+    #[tokio::test]
+    async fn legacy_oidc_sts_uses_signed_policy_without_root_ownership() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = crate::root_credentials::credentials_or_default().access_key;
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.clone())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+        let get_args = Args {
+            account: "legacy-oidc-sts-access-key",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        let get_prepared = iam_sys.prepare_sts_auth(&get_args, &parent_user).await;
+        assert!(iam_sys.eval_prepared(&get_prepared, &get_args).await);
+
+        let mut admin_args = get_args;
+        admin_args.action = Action::AdminAction(AdminAction::CreateUserAdminAction);
+        admin_args.bucket = "";
+        admin_args.object = "";
+        let admin_prepared = iam_sys.prepare_sts_auth(&admin_args, &parent_user).await;
+        assert!(!iam_sys.eval_prepared(&admin_prepared, &admin_args).await);
+    }
+
+    #[tokio::test]
+    async fn reparented_verified_oidc_sts_cannot_use_parent_mapping() {
+        let iam_sys = test_iam_sys().await;
+        let parent_user = "sts-fallback-test-parent";
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (
+                OIDC_VIRTUAL_PARENT_CLAIM.to_string(),
+                Value::String("original-virtual-parent".to_string()),
+            ),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+        let args = Args {
+            account: "reparented-oidc-sts-access-key",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+
+        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+    }
+
+    #[tokio::test]
+    async fn verified_federated_policy_requires_matching_parent() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String("virtual-parent-a".to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("virtual-parent-a".to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+
+        let result = iam_sys
+            .verified_federated_service_account_claims(&claims, "virtual-parent-b", &None)
+            .await;
+
+        assert!(matches!(result, Err(IamError::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn verified_federated_policy_rejects_reparented_session() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String("derived-parent".to_string())),
+            (
+                OIDC_VIRTUAL_PARENT_CLAIM.to_string(),
+                Value::String("original-virtual-parent".to_string()),
+            ),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+
+        let result = iam_sys
+            .verified_federated_service_account_claims(&claims, "derived-parent", &None)
+            .await;
+
+        assert!(matches!(result, Err(IamError::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn verified_federated_policy_rejects_partially_missing_policies() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "virtual-parent";
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite,missing-policy".to_string())),
+        ]);
+
+        let result = iam_sys
+            .verified_federated_service_account_claims(&claims, parent_user, &None)
+            .await;
+
+        assert!(matches!(result, Err(IamError::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn unmarked_oidc_service_account_cannot_inherit_same_name_parent_policy() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+        let parent_user = "sts-fallback-test-parent";
+        iam_sys
+            .store
+            .cache
+            .add_or_update_user_policy(parent_user, &MappedPolicy::new("readwrite"), OffsetDateTime::now_utc());
+        let (credential, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "LEGACYOIDCSERVICE01".to_string(),
+                    secret_key: "legacyOidcServiceSecret123".to_string(),
+                    claims: Some(HashMap::from([
+                        ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+                        ("oidc_provider".to_string(), Value::String("default".to_string())),
+                        ("sub".to_string(), Value::String("subject-123".to_string())),
+                        (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy-shaped OIDC service account should be stored");
+        let claims = iam_sys
+            .get_claims_for_svc_acc(&credential.access_key)
+            .await
+            .expect("stored service-account claims should decode");
+        let args = Args {
+            account: &credential.access_key,
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(!iam_sys.is_allowed(&args).await);
+    }
+
+    #[tokio::test]
+    async fn virtual_oidc_parent_namespace_cannot_be_created_as_iam_user() {
+        let iam_sys = test_iam_sys().await;
+        let request = AddOrUpdateUserReq {
+            secret_key: "ordinaryUserSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+
+        let result = iam_sys
+            .create_user("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I", &request)
+            .await;
+
+        assert!(matches!(result, Err(IamError::ContainsReservedChars)));
+    }
+
+    #[tokio::test]
+    async fn verified_federated_service_account_partially_missing_policy_fails_closed() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "virtual-parent";
+        let (credential, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "MISSINGPOLICYSERVICE1".to_string(),
+                    secret_key: "missingPolicyServiceSecret123".to_string(),
+                    claims: Some(HashMap::from([
+                        ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+                        ("oidc_provider".to_string(), Value::String("default".to_string())),
+                        ("sub".to_string(), Value::String("subject-123".to_string())),
+                        ("parent".to_string(), Value::String(parent_user.to_string())),
+                        (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+                        (POLICYNAME.to_string(), Value::String("readwrite,missing-policy".to_string())),
+                        (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("corrupt persisted service account should still load for authorization testing");
+        let claims = iam_sys
+            .get_claims_for_svc_acc(&credential.access_key)
+            .await
+            .expect("stored service-account claims should decode");
+        let args = Args {
+            account: &credential.access_key,
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(!iam_sys.is_allowed(&args).await);
+    }
+
+    #[tokio::test]
     async fn test_sts_claim_policy_ignores_unsafe_and_missing_policy_names() {
         let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
@@ -3469,7 +5117,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_user_notification_cleans_related_cache_state() {
         let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.unwrap();
+        let cache_manager = IamCache::new(store.clone()).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         const USER: &str = "deleted-notify-user";
@@ -3495,6 +5143,16 @@ mod tests {
             claims: Some(service_claims),
             ..Default::default()
         });
+        store
+            .saved_sts_users
+            .lock()
+            .expect("saved_sts_users mutex poisoned")
+            .insert(SVC_CHILD.to_string(), service_child.clone());
+        store
+            .saved_service_account_revisions
+            .lock()
+            .expect("saved_service_account_revisions mutex poisoned")
+            .insert(SVC_CHILD.to_string(), 1);
 
         let sts_child = UserIdentity::from(Credentials {
             access_key: STS_CHILD.to_string(),
@@ -3527,6 +5185,14 @@ mod tests {
         assert!(!cache.user_group_memberships.contains_key(USER));
         assert!(!cache.users.contains_key(SVC_CHILD));
         assert!(!cache.sts_accounts.contains_key(STS_CHILD));
+        assert!(
+            store
+                .saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .contains_key(SVC_CHILD),
+            "a delayed parent deletion notification must not delete a recreated child from shared storage"
+        );
         let group = cache.groups.get(GROUP).expect("group should remain after member removal");
         assert!(!group.members.contains(&USER.to_string()));
         assert!(group.members.contains(&OTHER_USER.to_string()));

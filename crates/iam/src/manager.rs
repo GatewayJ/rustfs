@@ -18,7 +18,10 @@ use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_s
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
+    store::{
+        GroupInfo, MappedPolicy, SITE_REPLICATION_TOMBSTONE_CLAIM, Store, UserType, is_service_account_replication_tombstone,
+        object::IAM_CONFIG_PREFIX,
+    },
     sys::{
         MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, SITE_REPLICATOR_CLAIM,
         SITE_REPLICATOR_SERVICE_ACCOUNT, STATUS_DISABLED, STATUS_ENABLED, UpdateServiceAccountOpts,
@@ -67,6 +70,8 @@ const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis
 #[cfg(test)]
 const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(1);
 const TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES: usize = 5;
+const IDENTITY_CAS_MAX_RETRIES: usize = 8;
+const CACHE_NOTIFICATION_MAX_RETRIES: usize = 8;
 
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
@@ -83,6 +88,59 @@ impl IAMFormat {
 
 fn get_iam_format_file_path() -> String {
     path_join_buf(&[&IAM_CONFIG_PREFIX, IAM_FORMAT_FILE])
+}
+
+fn hydrate_identity_claims(identity: &mut UserIdentity) -> Result<()> {
+    if identity.credentials.session_token.is_empty() {
+        return Ok(());
+    }
+    identity.credentials.claims = Some(if identity.credentials.expiration.is_none() {
+        extract_jwt_claims_allow_missing_exp(identity)?
+    } else {
+        extract_jwt_claims(identity)?
+    });
+    Ok(())
+}
+
+fn cache_value_fingerprint<T: Serialize>(value: Option<&T>) -> Result<Option<Vec<u8>>> {
+    value.map(serde_json::to_vec).transpose().map_err(Into::into)
+}
+
+enum CacheValueState {
+    Unchanged,
+    Changed,
+    Retry,
+}
+
+fn cache_value_state<T: Serialize>(
+    current: &Arc<CacheEntity<T>>,
+    original: &Arc<CacheEntity<T>>,
+    key: &str,
+    fingerprint: &Option<Vec<u8>>,
+) -> Result<CacheValueState> {
+    if cache_value_fingerprint(current.get(key))? != *fingerprint {
+        return Ok(CacheValueState::Changed);
+    }
+    if fingerprint.is_none() && !Arc::ptr_eq(current, original) {
+        return Ok(CacheValueState::Retry);
+    }
+    Ok(CacheValueState::Unchanged)
+}
+
+fn next_identity_update_at(existing: Option<&UserIdentity>, incoming: Option<OffsetDateTime>) -> Result<OffsetDateTime> {
+    if let Some(incoming) = incoming {
+        return Ok(incoming);
+    }
+    let now = OffsetDateTime::now_utc();
+    let Some(current) = existing.and_then(|identity| identity.update_at) else {
+        return Ok(now);
+    };
+    if current < now {
+        return Ok(now);
+    }
+    current
+        .checked_add(time::Duration::nanoseconds(1))
+        .ok_or_else(|| Error::other("IAM identity timestamp overflow"))
 }
 
 #[repr(u8)]
@@ -206,7 +264,7 @@ where
 
         // Background ticker for synchronization
         // Check if environment variable is set
-        let skip_background_task = get_env_opt_str("RUSTFS_SKIP_BACKGROUND_TASK").is_some();
+        let skip_background_task = cfg!(test) || get_env_opt_str("RUSTFS_SKIP_BACKGROUND_TASK").is_some();
 
         if !skip_background_task {
             // Background thread starts periodic updates or receives signal updates
@@ -293,6 +351,7 @@ where
     }
 
     pub async fn load_user(&self, access_key: &str) -> Result<()> {
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let mut users_map: HashMap<String, UserIdentity> = HashMap::new();
         let mut user_policy_map = HashMap::new();
         let mut sts_users_map = HashMap::new();
@@ -365,19 +424,54 @@ where
         self.cache.with_write_lock(|cache| {
             let now = OffsetDateTime::now_utc();
             for (key, user) in users_map.iter() {
-                cache.add_or_update_user(key, user, now);
+                if cache
+                    .state()
+                    .users
+                    .get(key)
+                    .is_none_or(|current| user.update_at >= current.update_at)
+                {
+                    cache.add_or_update_user(key, user, now);
+                }
             }
             for (key, user_policy) in user_policy_map.iter() {
-                cache.add_or_update_user_policy(key, user_policy, now);
+                if cache
+                    .state()
+                    .user_policies
+                    .get(key)
+                    .is_none_or(|current| user_policy.update_at >= current.update_at)
+                {
+                    cache.add_or_update_user_policy(key, user_policy, now);
+                }
             }
             for (key, sts_user) in sts_users_map.iter() {
-                cache.add_or_update_sts_account(key, sts_user, now);
+                if cache
+                    .state()
+                    .sts_accounts
+                    .get(key)
+                    .is_none_or(|current| sts_user.update_at >= current.update_at)
+                {
+                    cache.add_or_update_sts_account(key, sts_user, now);
+                }
             }
             for (key, sts_policy) in sts_policy_map.iter() {
-                cache.add_or_update_sts_policy(key, sts_policy, now);
+                if cache
+                    .state()
+                    .sts_policies
+                    .get(key)
+                    .is_none_or(|current| sts_policy.update_at >= current.update_at)
+                {
+                    cache.add_or_update_sts_policy(key, sts_policy, now);
+                }
             }
             for (key, policy_doc) in policy_docs_map.iter() {
-                cache.add_or_update_policy_doc(key, policy_doc, now);
+                if cache
+                    .state()
+                    .policy_docs
+                    .get(key)
+                    .is_none_or(|current| policy_doc.update_date >= current.update_date)
+                {
+                    cache.add_or_update_policy_doc(key, policy_doc, now);
+                }
             }
         });
 
@@ -782,124 +876,333 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
             return Err(Error::AccessKeyAlreadyExists);
         }
         drop(cache);
+        for user_type in [UserType::Reg, UserType::Sts] {
+            match self.api.load_user_identity(&cred.access_key, user_type).await {
+                Ok(_) => return Err(Error::AccessKeyAlreadyExists),
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
 
-        let u = UserIdentity::new(cred);
+        let access_key = cred.access_key.clone();
+        for _ in 0..IDENTITY_CAS_MAX_RETRIES {
+            let (existing, expected_version) = match self.api.load_user_identity_versioned(&access_key, UserType::Svc).await {
+                Ok((identity, version)) if is_service_account_replication_tombstone(&identity) => (Some(identity), version),
+                Ok(_) => return Err(Error::AccessKeyAlreadyExists),
+                Err(err) if is_err_no_such_user(&err) => (None, None),
+                Err(err) => return Err(err),
+            };
+            let updated_at = next_identity_update_at(existing.as_ref(), None)?;
+            let mut user = UserIdentity::new(cred.clone());
+            user.update_at = Some(updated_at);
+            if self
+                .api
+                .save_user_identity_if_version(&access_key, UserType::Svc, user.clone(), expected_version.as_deref())
+                .await?
+            {
+                self.update_user_with_claims(&access_key, user)?;
+                return Ok(updated_at);
+            }
+        }
 
-        self.api
-            .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
-            .await?;
+        Err(Error::other("service account changed concurrently"))
+    }
 
-        self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
+    pub async fn upsert_service_account(
+        &self,
+        cred: Credentials,
+        preserve_existing_status: bool,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<OffsetDateTime> {
+        if cred.access_key.is_empty() || cred.parent_user.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
 
-        Ok(OffsetDateTime::now_utc())
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
+        let cache = self.cache.snapshot();
+        if cache.sts_accounts.contains_key(&cred.access_key)
+            || cache.users.get(&cred.access_key).is_some_and(|identity| {
+                !identity.credentials.is_service_account() && !is_service_account_replication_tombstone(identity)
+            })
+        {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
+        drop(cache);
+        for user_type in [UserType::Reg, UserType::Sts] {
+            match self.api.load_user_identity(&cred.access_key, user_type).await {
+                Ok(_) => return Err(Error::AccessKeyAlreadyExists),
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        for _ in 0..IDENTITY_CAS_MAX_RETRIES {
+            let (mut existing, expected_version) =
+                match self.api.load_user_identity_versioned(&cred.access_key, UserType::Svc).await {
+                    Ok((identity, version)) => (Some(identity), version),
+                    Err(err) if is_err_no_such_user(&err) => (None, None),
+                    Err(err) => return Err(err),
+                };
+            if let Some(existing) = existing.as_mut() {
+                hydrate_identity_claims(existing)?;
+            }
+            let mut next = cred.clone();
+            if let Some(existing) = existing.as_ref() {
+                let is_tombstone = is_service_account_replication_tombstone(existing);
+                if !is_tombstone
+                    && (!existing.credentials.is_service_account()
+                        || !existing.credentials.parent_user.is_empty() && existing.credentials.parent_user != next.parent_user)
+                {
+                    return Err(Error::AccessKeyAlreadyExists);
+                }
+                if incoming_updated_at.is_some_and(|incoming| existing.update_at.is_some_and(|current| incoming < current)) {
+                    return Ok(existing.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+                }
+                if is_tombstone
+                    && incoming_updated_at.is_none_or(|incoming| existing.update_at.is_some_and(|current| incoming <= current))
+                {
+                    return Ok(existing.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+                }
+                if preserve_existing_status && !is_tombstone {
+                    next.status.clone_from(&existing.credentials.status);
+                }
+            }
+
+            let updated_at = next_identity_update_at(existing.as_ref(), incoming_updated_at)?;
+            let mut user = UserIdentity::new(next);
+            user.update_at = Some(updated_at);
+            if !self
+                .api
+                .save_user_identity_if_version(&cred.access_key, UserType::Svc, user.clone(), expected_version.as_deref())
+                .await?
+            {
+                continue;
+            }
+            self.update_user_with_claims_inner(&cred.access_key, user, false)?;
+            return Ok(updated_at);
+        }
+
+        Err(Error::other("service account changed concurrently"))
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
-        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
-        let cache = self.cache.snapshot();
-        let Some(ui) = cache.users.get(name).cloned() else {
-            return Err(Error::NoSuchServiceAccount(name.to_string()));
-        };
+        self.update_service_account_at(name, opts, None).await
+    }
 
-        if !ui.credentials.is_service_account() {
-            return Err(Error::NoSuchServiceAccount(name.to_string()));
-        }
-        drop(cache);
+    pub async fn update_replicated_service_account(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<OffsetDateTime> {
+        self.update_service_account_at(name, opts, incoming_updated_at).await
+    }
 
-        let mut cr = ui.credentials.clone();
-        let current_secret_key = cr.secret_key.clone();
+    async fn update_service_account_at(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<OffsetDateTime> {
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
+        for _ in 0..IDENTITY_CAS_MAX_RETRIES {
+            let (mut ui, expected_version) = self
+                .api
+                .load_user_identity_versioned(name, UserType::Svc)
+                .await
+                .map_err(|err| {
+                    if is_err_no_such_user(&err) {
+                        Error::NoSuchServiceAccount(name.to_string())
+                    } else {
+                        err
+                    }
+                })?;
+            hydrate_identity_claims(&mut ui)?;
 
-        if let Some(secret) = opts.secret_key {
-            if !is_secret_key_valid(&secret) {
-                return Err(Error::InvalidSecretKeyLength);
+            if !ui.credentials.is_service_account() {
+                return Err(Error::NoSuchServiceAccount(name.to_string()));
             }
-            cr.secret_key = secret;
-        }
-
-        if opts.name.is_some() {
-            cr.name = opts.name;
-        }
-
-        if opts.description.is_some() {
-            cr.description = opts.description;
-        }
-
-        let token_without_expiration = cr.expiration.is_none();
-
-        if opts.expiration.is_some() {
-            // TODO: check expiration
-            cr.expiration = opts.expiration;
-        }
-
-        if let Some(status) = opts.status {
-            match status.as_str() {
-                val if val == AccountStatus::Enabled.as_ref() => cr.status = auth::ACCOUNT_ON.to_owned(),
-                val if val == AccountStatus::Disabled.as_ref() => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                auth::ACCOUNT_ON => cr.status = auth::ACCOUNT_ON.to_owned(),
-                auth::ACCOUNT_OFF => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                _ => cr.status = auth::ACCOUNT_OFF.to_owned(),
+            if incoming_updated_at.is_some_and(|incoming| ui.update_at.is_some_and(|current| incoming < current)) {
+                return Ok(ui.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
             }
-        }
 
-        let mut m: HashMap<String, Value> = if token_without_expiration {
-            get_claims_from_token_with_secret_allow_missing_exp(&cr.session_token, &current_secret_key)?
-        } else {
-            get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?
-        };
-        m.remove(SESSION_POLICY_NAME_EXTRACTED);
+            let opts = opts.clone();
+            let mut cr = ui.credentials.clone();
+            let current_secret_key = cr.secret_key.clone();
 
-        let nosp = if let Some(policy) = &opts.session_policy {
-            policy.version.is_empty() && policy.statements.is_empty()
-        } else {
-            false
-        };
-
-        if m.contains_key(SESSION_POLICY_NAME) && nosp {
-            m.remove(SESSION_POLICY_NAME);
-            m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
-        }
-
-        if let Some(session_policy) = &opts.session_policy {
-            session_policy.validate()?;
-            if !session_policy.version.is_empty() && !session_policy.statements.is_empty() {
-                let policy_buf = serde_json::to_vec(&session_policy)?;
-                if policy_buf.len() > MAX_SVCSESSION_POLICY_SIZE {
-                    return Err(Error::PolicyTooLarge);
+            if let Some(secret) = opts.secret_key {
+                if !is_secret_key_valid(&secret) {
+                    return Err(Error::InvalidSecretKeyLength);
                 }
-
-                m.insert(
-                    SESSION_POLICY_NAME.to_owned(),
-                    Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
-                );
-                m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
+                cr.secret_key = secret;
             }
+
+            if opts.name.is_some() {
+                cr.name = opts.name;
+            }
+
+            if opts.description.is_some() {
+                cr.description = opts.description;
+            }
+
+            let token_without_expiration = cr.expiration.is_none();
+
+            if opts.expiration.is_some() {
+                // TODO: check expiration
+                cr.expiration = opts.expiration;
+            }
+
+            if let Some(status) = opts.status {
+                match status.as_str() {
+                    val if val == AccountStatus::Enabled.as_ref() => cr.status = auth::ACCOUNT_ON.to_owned(),
+                    val if val == AccountStatus::Disabled.as_ref() => cr.status = auth::ACCOUNT_OFF.to_owned(),
+                    auth::ACCOUNT_ON => cr.status = auth::ACCOUNT_ON.to_owned(),
+                    auth::ACCOUNT_OFF => cr.status = auth::ACCOUNT_OFF.to_owned(),
+                    _ => cr.status = auth::ACCOUNT_OFF.to_owned(),
+                }
+            }
+
+            let mut m: HashMap<String, Value> = if token_without_expiration {
+                get_claims_from_token_with_secret_allow_missing_exp(&cr.session_token, &current_secret_key)?
+            } else {
+                get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?
+            };
+            m.remove(SESSION_POLICY_NAME_EXTRACTED);
+
+            let nosp = if let Some(policy) = &opts.session_policy {
+                policy.version.is_empty() && policy.statements.is_empty()
+            } else {
+                false
+            };
+
+            if m.contains_key(SESSION_POLICY_NAME) && nosp {
+                m.remove(SESSION_POLICY_NAME);
+                m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
+            }
+
+            if let Some(session_policy) = &opts.session_policy {
+                session_policy.validate()?;
+                if !session_policy.version.is_empty() && !session_policy.statements.is_empty() {
+                    let policy_buf = serde_json::to_vec(&session_policy)?;
+                    if policy_buf.len() > MAX_SVCSESSION_POLICY_SIZE {
+                        return Err(Error::PolicyTooLarge);
+                    }
+
+                    m.insert(
+                        SESSION_POLICY_NAME.to_owned(),
+                        Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
+                    );
+                    m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
+                }
+            }
+
+            if let Some(expiration) = opts.expiration {
+                m.insert("exp".to_owned(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
+            }
+
+            m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
+            if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
+                m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+            }
+
+            cr.session_token = jwt_sign(&m, &cr.secret_key)?;
+
+            let updated_at = next_identity_update_at(Some(&ui), incoming_updated_at)?;
+            let mut u = UserIdentity::new(cr);
+            u.update_at = Some(updated_at);
+            if !self
+                .api
+                .save_user_identity_if_version(name, UserType::Svc, u.clone(), expected_version.as_deref())
+                .await?
+            {
+                continue;
+            }
+            self.update_user_with_claims(name, u)?;
+            return Ok(updated_at);
         }
 
-        if let Some(expiration) = opts.expiration {
-            m.insert("exp".to_owned(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
+        Err(Error::other("service account changed concurrently"))
+    }
+
+    pub async fn tombstone_service_account(
+        &self,
+        access_key: &str,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> Result<Option<OffsetDateTime>> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidArgument);
         }
 
-        m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
-        if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
-            m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
+        self.tombstone_service_account_locked(access_key, incoming_updated_at, None)
+            .await
+    }
+
+    async fn tombstone_service_account_locked(
+        &self,
+        access_key: &str,
+        incoming_updated_at: Option<OffsetDateTime>,
+        expected_parent: Option<&str>,
+    ) -> Result<Option<OffsetDateTime>> {
+        for _ in 0..IDENTITY_CAS_MAX_RETRIES {
+            let (mut existing, expected_version) = match self.api.load_user_identity_versioned(access_key, UserType::Svc).await {
+                Ok((identity, version)) => (Some(identity), version),
+                Err(err) if is_err_no_such_user(&err) => (None, None),
+                Err(err) => return Err(err),
+            };
+            if let Some(existing) = existing.as_mut() {
+                hydrate_identity_claims(existing)?;
+                if !existing.credentials.is_service_account() && !is_service_account_replication_tombstone(existing) {
+                    return Ok(None);
+                }
+                if expected_parent.is_some_and(|parent| existing.credentials.parent_user != parent) {
+                    return Ok(None);
+                }
+                if incoming_updated_at.is_some_and(|incoming| existing.update_at.is_some_and(|current| incoming <= current)) {
+                    return Ok(None);
+                }
+            }
+            if existing.is_none() && incoming_updated_at.is_none() {
+                return Ok(None);
+            }
+
+            let updated_at = next_identity_update_at(existing.as_ref(), incoming_updated_at)?;
+            let tombstone = UserIdentity {
+                version: existing.as_ref().map_or(1, |identity| identity.version),
+                credentials: Credentials {
+                    access_key: access_key.to_string(),
+                    status: auth::ACCOUNT_OFF.to_string(),
+                    parent_user: existing.as_ref().map_or_else(
+                        || expected_parent.unwrap_or_default().to_string(),
+                        |identity| identity.credentials.parent_user.clone(),
+                    ),
+                    claims: Some(HashMap::from([(SITE_REPLICATION_TOMBSTONE_CLAIM.to_string(), Value::Bool(true))])),
+                    ..Default::default()
+                },
+                update_at: Some(updated_at),
+            };
+            if !self
+                .api
+                .save_user_identity_if_version(access_key, UserType::Svc, tombstone, expected_version.as_deref())
+                .await?
+            {
+                continue;
+            }
+
+            let _ = self.api.delete_mapped_policy(access_key, UserType::Svc, false).await;
+            let now = OffsetDateTime::now_utc();
+            self.cache.delete_user_policy(access_key, now);
+            self.cache.delete_user(access_key, now);
+            return Ok(Some(updated_at));
         }
 
-        cr.session_token = jwt_sign(&m, &cr.secret_key)?;
-
-        let u = UserIdentity::new(cr);
-        let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
-        self.api
-            .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
-            .await?;
-        self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
-
-        Ok(updated_at)
+        Err(Error::other("service account changed concurrently"))
     }
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
@@ -1151,6 +1454,12 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
+        let cache = self.cache.snapshot();
+        if cache.users.contains_key(access_key) {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
+        drop(cache);
         let sts_policy_update = if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
@@ -1330,11 +1639,13 @@ where
     }
 
     pub async fn add_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
-        if let Some(x) = users.get(access_key) {
+        let existing = users.get(access_key).cloned();
+        if let Some(x) = existing.as_ref() {
             warn!(error = ?x, "IAM user already exists");
-            if x.credentials.is_temp() {
+            if x.credentials.is_temp() || x.credentials.is_service_account() {
                 return Err(Error::AccessKeyAlreadyExists);
             }
         }
@@ -1347,12 +1658,14 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entry = UserIdentity::from(Credentials {
+        let updated_at = next_identity_update_at(existing.as_ref(), None)?;
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
 
         self.api
             .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
@@ -1360,7 +1673,7 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
@@ -1368,32 +1681,16 @@ where
         Ok(())
     }
 
-    pub async fn delete_service_account_with_revision(&self, access_key: &str) -> Result<OffsetDateTime> {
-        self.delete_user_with_revision(access_key, UserType::Svc).await
-    }
-
     async fn delete_user_with_revision(&self, access_key: &str, utype: UserType) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
 
-        let _service_account_guard = if utype == UserType::Svc {
-            Some(self.cache.service_account_mutation_lock().lock().await)
-        } else {
-            None
-        };
-
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         if utype == UserType::Reg {
             let cache = self.cache.snapshot();
             let member_of = cache.user_group_memberships.get(access_key).cloned();
             drop(cache);
-            if let Some(member_of) = member_of {
-                for member in member_of.iter() {
-                    let _ = self
-                        .remove_members_from_group(member, vec![access_key.to_string()], false)
-                        .await?;
-                }
-            }
 
             let mut service_accounts_to_delete = Vec::new();
             let mut temp_accounts_to_delete = HashSet::new();
@@ -1421,15 +1718,20 @@ where
             for access_key in service_accounts_to_delete.iter() {
                 let _ = self.api.delete_user_identity(access_key, UserType::Svc).await;
             }
+
+            if let Some(member_of) = member_of {
+                for member in member_of.iter() {
+                    let _ = self
+                        .remove_members_from_group(member, vec![access_key.to_string()], false)
+                        .await?;
+                }
+            }
             for access_key in temp_accounts_to_delete.iter() {
                 let _ = self.api.delete_user_identity(access_key, UserType::Sts).await;
             }
 
             self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
-                for access_key in service_accounts_to_delete.iter() {
-                    cache.delete_user(access_key, now);
-                }
                 for access_key in temp_accounts_to_delete.iter() {
                     cache.delete_sts_account(access_key, now);
                     cache.delete_user(access_key, now);
@@ -1463,6 +1765,7 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1473,15 +1776,16 @@ where
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
 
-        let u = UserIdentity::from(cred);
+        let mut next = UserIdentity::from(cred);
+        next.update_at = Some(next_identity_update_at(Some(u), None)?);
         drop(cache);
         drop(users);
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, u.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, next.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, u)
+        self.update_user_with_claims(access_key, next)
     }
 
     /// Add SSH public key for a user (for SFTP authentication)
@@ -1490,6 +1794,7 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1499,6 +1804,7 @@ where
 
         let mut user_identity = u.clone();
         user_identity.add_ssh_public_key(public_key);
+        user_identity.update_at = Some(next_identity_update_at(Some(u), None)?);
         drop(cache);
         drop(users);
 
@@ -1518,6 +1824,7 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1536,12 +1843,14 @@ where
             }
         };
 
-        let user_entry = UserIdentity::from(Credentials {
+        let updated_at = next_identity_update_at(Some(u), None)?;
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
         drop(cache);
         drop(users);
 
@@ -1551,20 +1860,35 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
+        self.update_user_with_claims_inner(k, u, false)
+    }
+
+    fn update_user_with_claims_inner(&self, k: &str, u: UserIdentity, allow_stale: bool) -> Result<()> {
         let mut u = u;
-        if !u.credentials.session_token.is_empty() {
-            u.credentials.claims = Some(if u.credentials.expiration.is_none() {
-                extract_jwt_claims_allow_missing_exp(&u)?
-            } else {
-                extract_jwt_claims(&u)?
-            });
+        hydrate_identity_claims(&mut u)?;
+
+        let is_sts = u.credentials.is_temp() && !u.credentials.is_service_account();
+        let cache = self.cache.snapshot();
+        let current = if is_sts {
+            cache.sts_accounts.get(k)
+        } else {
+            cache.users.get(k)
+        };
+        let is_stale = current.is_some_and(|current| match (u.update_at, current.update_at) {
+            (Some(incoming), Some(existing)) => incoming < existing,
+            (None, Some(_)) => true,
+            _ => false,
+        });
+        drop(cache);
+        if is_stale && !allow_stale {
+            return Ok(());
         }
 
-        if u.credentials.is_temp() && !u.credentials.is_service_account() {
+        if is_sts {
             self.cache.add_or_update_sts_account(k, &u, OffsetDateTime::now_utc());
         } else {
             self.cache.add_or_update_user(k, &u, OffsetDateTime::now_utc());
@@ -1860,42 +2184,103 @@ where
     }
 
     pub async fn group_notification_handler(&self, group: &str) -> Result<()> {
-        let mut m = HashMap::new();
-        if let Err(err) = self.api.load_group_no_lock(group, &mut m).await {
-            if !is_err_no_such_group(&err) {
-                return Err(err);
+        for _ in 0..CACHE_NOTIFICATION_MAX_RETRIES {
+            if !self.group_notification_handler_once(group).await? {
+                return Ok(());
             }
+        }
+        Err(Error::other("group cache changed repeatedly during refresh"))
+    }
 
-            self.cache.with_write_lock(|cache| {
+    async fn group_notification_handler_once(&self, group: &str) -> Result<bool> {
+        let cache = self.cache.snapshot();
+        let original_groups = Arc::clone(&cache.groups);
+        let original_group_policies = Arc::clone(&cache.group_policies);
+        let cached_group = cache_value_fingerprint(cache.groups.get(group))?;
+        let cached_group_policy = cache_value_fingerprint(cache.group_policies.get(group))?;
+        drop(cache);
+        let mut m = HashMap::new();
+        let missing = match self.api.load_group_no_lock(group, &mut m).await {
+            Ok(()) => !m.contains_key(group),
+            Err(err) if is_err_no_such_group(&err) => true,
+            Err(err) => return Err(err),
+        };
+        if missing {
+            let retry = self.cache.with_write_lock(|cache| -> Result<bool> {
+                match cache_value_state(&cache.state().groups, &original_groups, group, &cached_group)? {
+                    CacheValueState::Changed => return Ok(false),
+                    CacheValueState::Retry => return Ok(true),
+                    CacheValueState::Unchanged => {}
+                }
                 let now = OffsetDateTime::now_utc();
                 self.remove_group_from_memberships_map_unlocked(cache, group, now);
                 cache.delete_group(group, now);
-                cache.delete_group_policy(group, now);
-            });
+                match cache_value_state(&cache.state().group_policies, &original_group_policies, group, &cached_group_policy)? {
+                    CacheValueState::Unchanged => cache.delete_group_policy(group, now),
+                    CacheValueState::Changed => {}
+                    CacheValueState::Retry => return Ok(true),
+                }
+                Ok(false)
+            })?;
 
-            return Ok(());
+            return Ok(retry);
         }
 
-        let gi = m[group].clone();
+        let gi = m.remove(group).ok_or_else(|| Error::other("loaded group is missing"))?;
 
-        self.cache.with_write_lock(|cache| {
+        self.cache.with_write_lock(|cache| -> Result<bool> {
+            match cache_value_state(&cache.state().groups, &original_groups, group, &cached_group)? {
+                CacheValueState::Changed => return Ok(false),
+                CacheValueState::Retry => return Ok(true),
+                CacheValueState::Unchanged => {}
+            }
+            if cache
+                .state()
+                .groups
+                .get(group)
+                .is_some_and(|current| match (gi.update_at, current.update_at) {
+                    (Some(incoming), Some(existing)) => incoming < existing,
+                    (None, Some(_)) => true,
+                    _ => false,
+                })
+            {
+                return Ok(false);
+            }
             let now = OffsetDateTime::now_utc();
             cache.add_or_update_group(group, &gi, now);
             self.remove_group_from_memberships_map_unlocked(cache, group, now);
             self.update_group_memberships_map_unlocked(cache, group, &gi, now);
-        });
-
-        Ok(())
+            Ok(false)
+        })
     }
 
     pub async fn policy_notification_handler(&self, policy: &str) -> Result<()> {
-        let mut m = HashMap::new();
-        if let Err(err) = self.api.load_policy_doc_no_lock(policy, &mut m).await {
-            if !is_err_no_such_policy(&err) {
-                return Err(err);
+        for _ in 0..CACHE_NOTIFICATION_MAX_RETRIES {
+            if !self.policy_notification_handler_once(policy).await? {
+                return Ok(());
             }
+        }
+        Err(Error::other("policy cache changed repeatedly during refresh"))
+    }
 
-            self.cache.with_write_lock(|cache| {
+    async fn policy_notification_handler_once(&self, policy: &str) -> Result<bool> {
+        let cache = self.cache.snapshot();
+        let original_policies = Arc::clone(&cache.policy_docs);
+        let cached_policy = cache_value_fingerprint(cache.policy_docs.get(policy))?;
+        drop(cache);
+        let mut m = HashMap::new();
+        let missing = match self.api.load_policy_doc_no_lock(policy, &mut m).await {
+            Ok(()) => !m.contains_key(policy),
+            Err(err) if is_err_no_such_policy(&err) => true,
+            Err(err) => return Err(err),
+        };
+        if missing {
+            let retry = self.cache.with_write_lock(|cache| -> Result<bool> {
+                match cache_value_state(&cache.state().policy_docs, &original_policies, policy, &cached_policy)? {
+                    CacheValueState::Changed => return Ok(false),
+                    CacheValueState::Retry => return Ok(true),
+                    CacheValueState::Unchanged => {}
+                }
                 let now = OffsetDateTime::now_utc();
                 cache.delete_policy_doc(policy, now);
 
@@ -1927,26 +2312,75 @@ where
                         cache.add_or_update_group_policy(k, &mp, now);
                     }
                 }
-            });
+                Ok(false)
+            })?;
 
-            return Ok(());
+            return Ok(retry);
         }
 
-        self.cache.with_write_lock(|cache| {
-            cache.add_or_update_policy_doc(policy, &m[policy], OffsetDateTime::now_utc());
-        });
-
-        Ok(())
+        let incoming = m.remove(policy).ok_or_else(|| Error::other("loaded policy is missing"))?;
+        self.cache.with_write_lock(|cache| -> Result<bool> {
+            match cache_value_state(&cache.state().policy_docs, &original_policies, policy, &cached_policy)? {
+                CacheValueState::Changed => return Ok(false),
+                CacheValueState::Retry => return Ok(true),
+                CacheValueState::Unchanged => {}
+            }
+            if cache
+                .state()
+                .policy_docs
+                .get(policy)
+                .is_some_and(|current| incoming.update_date < current.update_date)
+            {
+                return Ok(false);
+            }
+            cache.add_or_update_policy_doc(policy, &incoming, OffsetDateTime::now_utc());
+            Ok(false)
+        })
     }
 
     pub async fn policy_mapping_notification_handler(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
-        let mut m = HashMap::new();
-        if let Err(err) = self.api.load_mapped_policy_no_lock(name, user_type, is_group, &mut m).await {
-            if !is_err_no_such_policy(&err) {
-                return Err(err);
+        for _ in 0..CACHE_NOTIFICATION_MAX_RETRIES {
+            if !self
+                .policy_mapping_notification_handler_once(name, user_type, is_group)
+                .await?
+            {
+                return Ok(());
             }
+        }
+        Err(Error::other("policy mapping cache changed repeatedly during refresh"))
+    }
 
-            self.cache.with_write_lock(|cache| {
+    async fn policy_mapping_notification_handler_once(&self, name: &str, user_type: UserType, is_group: bool) -> Result<bool> {
+        let cache = self.cache.snapshot();
+        let original_mappings = if is_group {
+            Arc::clone(&cache.group_policies)
+        } else if user_type == UserType::Sts {
+            Arc::clone(&cache.sts_policies)
+        } else {
+            Arc::clone(&cache.user_policies)
+        };
+        let cached_mapping = cache_value_fingerprint(original_mappings.get(name))?;
+        drop(cache);
+        let mut m = HashMap::new();
+        let missing = match self.api.load_mapped_policy_no_lock(name, user_type, is_group, &mut m).await {
+            Ok(()) => !m.contains_key(name),
+            Err(err) if is_err_no_such_policy(&err) => true,
+            Err(err) => return Err(err),
+        };
+        if missing {
+            let retry = self.cache.with_write_lock(|cache| -> Result<bool> {
+                let current_mappings = if is_group {
+                    &cache.state().group_policies
+                } else if user_type == UserType::Sts {
+                    &cache.state().sts_policies
+                } else {
+                    &cache.state().user_policies
+                };
+                match cache_value_state(current_mappings, &original_mappings, name, &cached_mapping)? {
+                    CacheValueState::Changed => return Ok(false),
+                    CacheValueState::Retry => return Ok(true),
+                    CacheValueState::Unchanged => {}
+                }
                 let now = OffsetDateTime::now_utc();
                 if is_group {
                     cache.delete_group_policy(name, now);
@@ -1955,14 +2389,33 @@ where
                 } else {
                     cache.delete_user_policy(name, now);
                 }
-            });
+                Ok(false)
+            })?;
 
-            return Ok(());
+            return Ok(retry);
         }
 
-        let mp = m[name].clone();
+        let mp = m
+            .remove(name)
+            .ok_or_else(|| Error::other("loaded policy mapping is missing"))?;
 
-        self.cache.with_write_lock(|cache| {
+        self.cache.with_write_lock(|cache| -> Result<bool> {
+            let current_mappings = if is_group {
+                &cache.state().group_policies
+            } else if user_type == UserType::Sts {
+                &cache.state().sts_policies
+            } else {
+                &cache.state().user_policies
+            };
+            match cache_value_state(current_mappings, &original_mappings, name, &cached_mapping)? {
+                CacheValueState::Changed => return Ok(false),
+                CacheValueState::Retry => return Ok(true),
+                CacheValueState::Unchanged => {}
+            }
+            let current = current_mappings.get(name);
+            if current.is_some_and(|current| mp.update_at < current.update_at) {
+                return Ok(false);
+            }
             let now = OffsetDateTime::now_utc();
             if is_group {
                 cache.add_or_update_group_policy(name, &mp, now);
@@ -1971,50 +2424,61 @@ where
             } else {
                 cache.add_or_update_user_policy(name, &mp, now);
             }
-        });
-
-        Ok(())
+            Ok(false)
+        })
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
-        let _service_account_guard = if user_type == UserType::Svc {
-            Some(self.cache.service_account_mutation_lock().lock().await)
-        } else {
-            None
+        for _ in 0..CACHE_NOTIFICATION_MAX_RETRIES {
+            if !self.user_notification_handler_once(name, user_type).await? {
+                return Ok(());
+            }
+        }
+        Err(Error::other("user cache changed repeatedly during refresh"))
+    }
+
+    async fn user_notification_handler_once(&self, name: &str, user_type: UserType) -> Result<bool> {
+        let _mutation_guard = self.cache.identity_mutation_lock().lock().await;
+        let cache = self.cache.snapshot();
+        let original_identities = match user_type {
+            UserType::Sts => Arc::clone(&cache.sts_accounts),
+            UserType::Reg | UserType::Svc | UserType::None => Arc::clone(&cache.users),
         };
+        let cached_identity = cache_value_fingerprint(original_identities.get(name))?;
+        let original_user_policies = Arc::clone(&cache.user_policies);
+        let cached_user_policy = cache_value_fingerprint(cache.user_policies.get(name))?;
+        let mut service_accounts_to_delete = Vec::new();
+        let mut temp_accounts_to_delete = Vec::new();
+        if user_type == UserType::Reg {
+            for (access_key, identity) in cache.users.iter() {
+                let credentials = &identity.credentials;
+                if credentials.parent_user == name && credentials.is_service_account() {
+                    service_accounts_to_delete.push((access_key.clone(), cache_value_fingerprint(Some(identity))?));
+                }
+            }
+            for (access_key, identity) in cache.sts_accounts.iter() {
+                if identity.credentials.parent_user == name {
+                    temp_accounts_to_delete.push((access_key.clone(), cache_value_fingerprint(Some(identity))?));
+                }
+            }
+        }
+        drop(cache);
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_user_no_lock(name, user_type, &mut m).await {
-            if !is_err_no_such_user(&err) {
-                return Err(err);
-            }
-
-            let mut service_accounts_to_delete = Vec::new();
-            let mut temp_accounts_to_delete = HashSet::new();
-            if user_type == UserType::Reg {
-                let cache = self.cache.snapshot();
-                for v in cache.users.values() {
-                    let u = &v.credentials;
-                    if u.parent_user.as_str() == name && u.is_service_account() {
-                        service_accounts_to_delete.push(u.access_key.clone());
-                    }
+        let missing = match self.api.load_user_no_lock(name, user_type, &mut m).await {
+            Ok(()) => !m.contains_key(name),
+            Err(err) if is_err_no_such_user(&err) => true,
+            Err(err) => return Err(err),
+        };
+        if missing {
+            let retry = self.cache.with_write_lock(|cache| -> Result<bool> {
+                let current_identities = match user_type {
+                    UserType::Sts => &cache.state().sts_accounts,
+                    UserType::Reg | UserType::Svc | UserType::None => &cache.state().users,
+                };
+                match cache_value_state(current_identities, &original_identities, name, &cached_identity)? {
+                    CacheValueState::Changed => return Ok(false),
+                    CacheValueState::Retry => return Ok(true),
+                    CacheValueState::Unchanged => {}
                 }
-
-                for u in cache.sts_accounts.values() {
-                    let u = &u.credentials;
-                    if u.parent_user.as_str() == name {
-                        temp_accounts_to_delete.insert(u.access_key.clone());
-                    }
-                }
-                drop(cache);
-
-                for access_key in service_accounts_to_delete.iter() {
-                    let _ = self.api.delete_user_identity(access_key, UserType::Svc).await;
-                }
-                for access_key in temp_accounts_to_delete.iter() {
-                    let _ = self.api.delete_user_identity(access_key, UserType::Sts).await;
-                }
-            }
-
-            self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
                 match user_type {
                     UserType::Sts => cache.delete_sts_account(name, now),
@@ -2023,27 +2487,41 @@ where
                 }
                 self.remove_user_from_cached_groups(cache, name, now);
                 if user_type == UserType::Reg {
-                    for access_key in service_accounts_to_delete.iter() {
-                        cache.delete_user(access_key, now);
+                    for (access_key, fingerprint) in service_accounts_to_delete.iter() {
+                        if cache_value_fingerprint(cache.state().users.get(access_key))? == *fingerprint {
+                            cache.delete_user(access_key, now);
+                        }
                     }
-                    for access_key in temp_accounts_to_delete.iter() {
-                        cache.delete_sts_account(access_key, now);
-                        cache.delete_user(access_key, now);
+                    for (access_key, fingerprint) in temp_accounts_to_delete.iter() {
+                        if cache_value_fingerprint(cache.state().sts_accounts.get(access_key))? == *fingerprint {
+                            cache.delete_sts_account(access_key, now);
+                            cache.delete_user(access_key, now);
+                        }
                     }
                 }
-                cache.delete_user_policy(name, now);
-            });
+                match cache_value_state(&cache.state().user_policies, &original_user_policies, name, &cached_user_policy)? {
+                    CacheValueState::Unchanged => cache.delete_user_policy(name, now),
+                    CacheValueState::Changed => {}
+                    CacheValueState::Retry => return Ok(true),
+                }
+                Ok(false)
+            })?;
 
-            return Ok(());
+            return Ok(retry);
         }
 
-        let u = m[name].clone();
+        let mut u = m.remove(name).ok_or_else(|| Error::other("loaded user is missing"))?;
+        hydrate_identity_claims(&mut u)?;
         let mut user_policy_update = None;
         let mut sts_policy_update = None;
 
         match user_type {
             UserType::Sts => {
                 let parent_user = u.credentials.parent_user.clone();
+                let cache = self.cache.snapshot();
+                let original = Arc::clone(&cache.sts_policies);
+                let fingerprint = cache_value_fingerprint(original.get(&parent_user))?;
+                drop(cache);
                 let mut policies = HashMap::new();
                 if let Err(err) = self
                     .api
@@ -2054,7 +2532,7 @@ where
                         return Err(err);
                     }
                 } else if let Some(policy) = policies.get(&parent_user).cloned() {
-                    sts_policy_update = Some((parent_user, policy));
+                    sts_policy_update = Some((parent_user, policy, original, fingerprint));
                 }
             }
             UserType::Reg => {
@@ -2068,7 +2546,8 @@ where
                         return Err(err);
                     }
                 } else if let Some(policy) = policies.get(name).cloned() {
-                    user_policy_update = Some((name.to_string(), policy));
+                    user_policy_update =
+                        Some((name.to_string(), policy, Arc::clone(&original_user_policies), cached_user_policy.clone()));
                 }
             }
 
@@ -2083,6 +2562,10 @@ where
                 drop(cache);
 
                 if parent_user_type == UserType::Reg {
+                    let cache = self.cache.snapshot();
+                    let original = Arc::clone(&cache.user_policies);
+                    let fingerprint = cache_value_fingerprint(original.get(&parent_user))?;
+                    drop(cache);
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
@@ -2093,9 +2576,13 @@ where
                             return Err(err);
                         }
                     } else if let Some(policy) = policies.get(&parent_user).cloned() {
-                        user_policy_update = Some((parent_user, policy));
+                        user_policy_update = Some((parent_user, policy, original, fingerprint));
                     }
                 } else {
+                    let cache = self.cache.snapshot();
+                    let original = Arc::clone(&cache.sts_policies);
+                    let fingerprint = cache_value_fingerprint(original.get(&parent_user))?;
+                    drop(cache);
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
@@ -2106,14 +2593,33 @@ where
                             return Err(err);
                         }
                     } else if let Some(policy) = policies.get(&parent_user).cloned() {
-                        sts_policy_update = Some((parent_user, policy));
+                        sts_policy_update = Some((parent_user, policy, original, fingerprint));
                     }
                 }
             }
             UserType::None => {}
         }
 
-        self.cache.with_write_lock(|cache| {
+        self.cache.with_write_lock(|cache| -> Result<bool> {
+            let current_identities = match user_type {
+                UserType::Sts => &cache.state().sts_accounts,
+                UserType::Reg | UserType::Svc | UserType::None => &cache.state().users,
+            };
+            match cache_value_state(current_identities, &original_identities, name, &cached_identity)? {
+                CacheValueState::Changed => return Ok(false),
+                CacheValueState::Retry => return Ok(true),
+                CacheValueState::Unchanged => {}
+            }
+            let current = current_identities.get(name);
+            let is_stale = current.is_some_and(|current| match (u.update_at, current.update_at) {
+                (Some(incoming), Some(existing)) => incoming < existing,
+                (None, Some(_)) => true,
+                _ => false,
+            });
+            if is_stale {
+                return Ok(false);
+            }
+
             let now = OffsetDateTime::now_utc();
             match user_type {
                 UserType::Sts => {
@@ -2125,15 +2631,40 @@ where
                 UserType::None => {}
             }
 
-            if let Some((name, policy)) = &user_policy_update {
-                cache.add_or_update_user_policy(name, policy, now);
+            if let Some((name, policy, original, fingerprint)) = &user_policy_update {
+                match cache_value_state(&cache.state().user_policies, original, name, fingerprint)? {
+                    CacheValueState::Unchanged => {
+                        if cache
+                            .state()
+                            .user_policies
+                            .get(name)
+                            .is_none_or(|current| policy.update_at >= current.update_at)
+                        {
+                            cache.add_or_update_user_policy(name, policy, now);
+                        }
+                    }
+                    CacheValueState::Changed => {}
+                    CacheValueState::Retry => return Ok(true),
+                }
             }
-            if let Some((name, policy)) = &sts_policy_update {
-                cache.add_or_update_sts_policy(name, policy, now);
+            if let Some((name, policy, original, fingerprint)) = &sts_policy_update {
+                match cache_value_state(&cache.state().sts_policies, original, name, fingerprint)? {
+                    CacheValueState::Unchanged => {
+                        if cache
+                            .state()
+                            .sts_policies
+                            .get(name)
+                            .is_none_or(|current| policy.update_at >= current.update_at)
+                        {
+                            cache.add_or_update_sts_policy(name, policy, now);
+                        }
+                    }
+                    CacheValueState::Changed => {}
+                    CacheValueState::Retry => return Ok(true),
+                }
             }
-        });
-
-        Ok(())
+            Ok(false)
+        })
     }
 }
 
@@ -2585,6 +3116,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_identity_refresh_cannot_replace_newer_cached_authorization_state() {
+        let cache = build_test_iam_cache(DelayedTempUserVisibilityStore::new(0));
+        let access_key = "STALECACHEIDENTITY01";
+        let newer_at = OffsetDateTime::now_utc();
+        let mut newer = UserIdentity::new(Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "newer-cache-secret".to_string(),
+            ..Default::default()
+        });
+        newer.update_at = Some(newer_at);
+        cache
+            .update_user_with_claims(access_key, newer)
+            .expect("newer identity should populate cache");
+
+        let mut older = UserIdentity::new(Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "older-cache-secret".to_string(),
+            ..Default::default()
+        });
+        older.update_at = Some(newer_at - time::Duration::nanoseconds(1));
+        cache
+            .update_user_with_claims(access_key, older)
+            .expect("stale refresh should be ignored");
+
+        let snapshot = cache.cache.snapshot();
+        assert_eq!(
+            snapshot
+                .users
+                .get(access_key)
+                .expect("cached identity should remain")
+                .credentials
+                .secret_key,
+            "newer-cache-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_regular_user_update_advances_future_persisted_revision() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = build_test_iam_cache(store.clone());
+        let access_key = "FUTUREREGULARUSER01";
+        let future = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+        let mut current = UserIdentity::new(Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "futureRegularOldSecret".to_string(),
+            status: auth::ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        current.update_at = Some(future);
+        cache
+            .update_user_with_claims(access_key, current)
+            .expect("future-dated identity should populate cache");
+
+        cache
+            .update_user_secret_key(access_key, "futureRegularNewSecret")
+            .await
+            .expect("local secret update should succeed");
+
+        let persisted = store
+            .saved_user
+            .lock()
+            .expect("saved_user mutex poisoned")
+            .clone()
+            .expect("updated identity should be persisted");
+        assert!(persisted.update_at.is_some_and(|updated_at| updated_at > future));
+        assert_eq!(
+            cache
+                .cache
+                .snapshot()
+                .users
+                .get(access_key)
+                .expect("updated identity should remain cached")
+                .credentials
+                .secret_key,
+            "futureRegularNewSecret"
+        );
+    }
+
     #[tokio::test]
     async fn set_temp_user_retries_until_sts_identity_becomes_visible() {
         let store = DelayedTempUserVisibilityStore::new(2);
@@ -2778,7 +3388,7 @@ mod tests {
 
         let delete = {
             let cache = Arc::clone(&cache);
-            tokio::spawn(async move { cache.delete_service_account_with_revision(access_key).await })
+            tokio::spawn(async move { cache.tombstone_service_account(access_key, None).await })
         };
         tokio::task::yield_now().await;
         assert!(!delete.is_finished(), "delete must wait for the in-flight cache refresh");
@@ -2788,7 +3398,14 @@ mod tests {
         delete.await.expect("delete task").expect("service account delete");
 
         assert!(!cache.cache.snapshot().users.contains_key(access_key));
-        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+        assert!(
+            store
+                .saved_user
+                .lock()
+                .expect("saved_user mutex poisoned")
+                .as_ref()
+                .is_some_and(crate::store::is_service_account_replication_tombstone)
+        );
     }
 
     #[tokio::test]

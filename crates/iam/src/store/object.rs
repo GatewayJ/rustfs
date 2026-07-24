@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{GroupInfo, MappedPolicy, Store, UserType};
+use super::{GroupInfo, MappedPolicy, Store, UserType, is_service_account_replication_tombstone};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
 use crate::{
     IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
@@ -32,7 +32,10 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -53,6 +56,31 @@ pub static IAM_CONFIG_POLICY_DB_USERS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/users/"));
 pub static IAM_CONFIG_POLICY_DB_STS_USERS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/sts-users/"));
+
+fn merge_reloaded_cache<T: Clone + Serialize>(
+    snapshot: &CacheEntity<T>,
+    current: &CacheEntity<T>,
+    loaded: CacheEntity<T>,
+) -> Result<CacheEntity<T>> {
+    let mut merged = current.clone();
+    let keys = snapshot.keys().chain(loaded.keys()).cloned().collect::<HashSet<_>>();
+    for key in keys {
+        let unchanged = match (snapshot.get(&key), current.get(&key)) {
+            (Some(snapshot), Some(current)) => serde_json::to_vec(snapshot)? == serde_json::to_vec(current)?,
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            continue;
+        }
+        if let Some(value) = loaded.get(&key) {
+            merged.insert(key, value.clone());
+        } else {
+            merged.remove(&key);
+        }
+    }
+    Ok(merged)
+}
 pub static IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/policydb/service-accounts/"));
 pub static IAM_CONFIG_POLICY_DB_GROUPS_PREFIX: LazyLock<String> =
@@ -593,8 +621,21 @@ impl ObjectStore {
 
     /// Parameterized core of [`Store::load_user_identity`].
     async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
-        let mut u: UserIdentity = self
-            .load_iam_config_with(get_user_identity_path(name, user_type), mode)
+        let (identity, _) = self.load_user_identity_with_version(name, user_type, mode).await?;
+        if is_service_account_replication_tombstone(&identity) {
+            return Err(Error::NoSuchUser(name.to_owned()));
+        }
+        Ok(identity)
+    }
+
+    async fn load_user_identity_with_version(
+        &self,
+        name: &str,
+        user_type: UserType,
+        mode: LoadMode,
+    ) -> Result<(UserIdentity, Option<String>)> {
+        let (data, object_info) = self
+            .load_iamconfig_bytes_with_metadata(get_user_identity_path(name, user_type), mode)
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
@@ -605,6 +646,7 @@ impl ObjectStore {
                     err
                 }
             })?;
+        let mut u: UserIdentity = serde_json::from_slice(&data)?;
 
         if u.credentials.is_expired() {
             let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
@@ -639,7 +681,7 @@ impl ObjectStore {
             }
         }
 
-        Ok(u)
+        Ok((u, object_info.etag))
     }
 
     /// Parameterized core of [`Store::load_user`].
@@ -883,6 +925,46 @@ impl Store for ObjectStore {
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity> {
         self.load_user_identity_with(name, user_type, LoadMode::Locked).await
     }
+    async fn load_user_identity_versioned(&self, name: &str, user_type: UserType) -> Result<(UserIdentity, Option<String>)> {
+        let (identity, version) = self
+            .load_user_identity_with_version(name, user_type, LoadMode::Locked)
+            .await?;
+        let version = version.ok_or_else(|| Error::other("IAM identity is missing an object revision"))?;
+        Ok((identity, Some(version)))
+    }
+    async fn save_user_identity_if_version(
+        &self,
+        name: &str,
+        user_type: UserType,
+        item: UserIdentity,
+        expected_version: Option<&str>,
+    ) -> Result<bool> {
+        self.check_storage_readiness().await?;
+
+        let path = get_user_identity_path(name, user_type);
+        let mut data = serde_json::to_vec(&item)?;
+        data = Self::prepare_data_for_storage(&data)?;
+        let mut opts = IamObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        };
+        opts.http_preconditions = Some(match expected_version {
+            Some(version) => HTTPPreconditions {
+                if_match: Some(version.to_string()),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        });
+
+        match save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await {
+            Ok(()) => Ok(true),
+            Err(IamStorageError::PreconditionFailed) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
     async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
         self.load_user_with(name, user_type, m, LoadMode::Locked).await
     }
@@ -909,7 +991,11 @@ impl Store for ObjectStore {
 
             if let Some(item) = v.item {
                 let name = rustfs_utils::path::dir(&item);
-                self.load_user(&name, user_type, m).await?;
+                if let Err(err) = self.load_user(&name, user_type, m).await
+                    && !is_err_no_such_user(&err)
+                {
+                    return Err(err);
+                }
             }
         }
         let _ = ctx.cancel();
@@ -1300,38 +1386,78 @@ impl Store for ObjectStore {
             }
         }
 
-        cache.with_write_lock(|cache| {
-            if cache.matches_snapshot(&cache_snapshot) {
-                cache.replace_policy_docs(policy_docs_cache);
-                if let Some(groups_cache) = groups_cache {
-                    cache.replace_groups(groups_cache);
-                }
-                if let Some(user_policies_cache) = user_policies_cache {
-                    cache.replace_user_policies(user_policies_cache);
-                }
-                if let Some(group_policies_cache) = group_policies_cache {
-                    cache.replace_group_policies(group_policies_cache);
-                }
-                cache.replace_users(user_items_cache);
-                cache.replace_sts_accounts(sts_items_cache);
-                cache.replace_sts_policies(sts_policies_cache);
-                cache.build_user_group_memberships();
-            } else {
-                warn!("IAM full reload cache commit skipped due to concurrent cache changes");
+        cache.with_write_lock(|cache| -> Result<()> {
+            cache.replace_policy_docs(merge_reloaded_cache(
+                &cache_snapshot.policy_docs,
+                &cache.state().policy_docs,
+                policy_docs_cache,
+            )?);
+            if let Some(groups_cache) = groups_cache {
+                cache.replace_groups(merge_reloaded_cache(&cache_snapshot.groups, &cache.state().groups, groups_cache)?);
             }
-        });
-
-        Ok(())
+            if let Some(user_policies_cache) = user_policies_cache {
+                cache.replace_user_policies(merge_reloaded_cache(
+                    &cache_snapshot.user_policies,
+                    &cache.state().user_policies,
+                    user_policies_cache,
+                )?);
+            }
+            if let Some(group_policies_cache) = group_policies_cache {
+                cache.replace_group_policies(merge_reloaded_cache(
+                    &cache_snapshot.group_policies,
+                    &cache.state().group_policies,
+                    group_policies_cache,
+                )?);
+            }
+            cache.replace_users(merge_reloaded_cache(&cache_snapshot.users, &cache.state().users, user_items_cache)?);
+            cache.replace_sts_accounts(merge_reloaded_cache(
+                &cache_snapshot.sts_accounts,
+                &cache.state().sts_accounts,
+                sts_items_cache,
+            )?);
+            cache.replace_sts_policies(merge_reloaded_cache(
+                &cache_snapshot.sts_policies,
+                &cache.state().sts_policies,
+                sts_policies_cache,
+            )?);
+            cache.build_user_group_memberships();
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DecryptSource, LoadMode, ObjectStore};
-    use crate::keyring;
+    use super::{DecryptSource, LoadMode, ObjectStore, merge_reloaded_cache};
+    use crate::{cache::CacheEntity, keyring, store::MappedPolicy};
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use serial_test::serial;
+    use std::collections::HashMap;
     use temp_env::with_vars;
+
+    #[test]
+    fn reloaded_cache_applies_remote_delete_while_preserving_concurrent_key_update() {
+        let deleted_key = "deleted-user".to_string();
+        let concurrent_key = "concurrent-user".to_string();
+        let snapshot = CacheEntity::new(HashMap::from([
+            (deleted_key.clone(), MappedPolicy::new("readwrite")),
+            (concurrent_key.clone(), MappedPolicy::new("readonly")),
+        ]));
+        let mut current = snapshot.clone();
+        current.insert(concurrent_key.clone(), MappedPolicy::new("writeonly"));
+        let loaded = CacheEntity::new(HashMap::from([(concurrent_key.clone(), MappedPolicy::new("readonly"))]));
+
+        let merged = merge_reloaded_cache(&snapshot, &current, loaded).expect("three-way cache merge should succeed");
+
+        assert!(!merged.contains_key(&deleted_key));
+        assert_eq!(
+            merged
+                .get(&concurrent_key)
+                .expect("concurrently updated key should remain")
+                .policies,
+            "writeonly"
+        );
+    }
 
     /// rustfs#4304 / startup contract rustfs#4056: the bulk snapshot load
     /// (`load_all`) must never depend on the node-counted namespace lock

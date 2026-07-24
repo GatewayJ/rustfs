@@ -15,7 +15,6 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
-    ptr,
     sync::{Arc, Mutex},
 };
 
@@ -64,7 +63,7 @@ impl Default for CacheState {
 pub struct Cache {
     state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
-    service_account_mutation_lock: AsyncMutex<()>,
+    identity_mutation_lock: AsyncMutex<()>,
 }
 
 impl Default for Cache {
@@ -72,7 +71,7 @@ impl Default for Cache {
         Self {
             state: ArcSwap::new(Arc::new(CacheState::default())),
             write_lock: Mutex::new(()),
-            service_account_mutation_lock: AsyncMutex::new(()),
+            identity_mutation_lock: AsyncMutex::new(()),
         }
     }
 }
@@ -80,8 +79,8 @@ impl Default for Cache {
 pub(crate) type CacheSnapshot = Guard<Arc<CacheState>>;
 
 impl Cache {
-    pub(crate) fn service_account_mutation_lock(&self) -> &AsyncMutex<()> {
-        &self.service_account_mutation_lock
+    pub(crate) fn identity_mutation_lock(&self) -> &AsyncMutex<()> {
+        &self.identity_mutation_lock
     }
 
     pub(crate) fn snapshot(&self) -> CacheSnapshot {
@@ -93,7 +92,6 @@ impl Cache {
         let current = self.state.load_full();
         let mut locked = LockedCache {
             state: CacheState::clone(&current),
-            current_ptr: Arc::as_ptr(&current),
             dirty: false,
         };
         let ret = f(&mut locked);
@@ -166,17 +164,12 @@ impl Cache {
 
 pub(crate) struct LockedCache {
     state: CacheState,
-    current_ptr: *const CacheState,
     dirty: bool,
 }
 
 impl LockedCache {
     pub(crate) fn state(&self) -> &CacheState {
         &self.state
-    }
-
-    pub(crate) fn matches_snapshot(&self, snapshot: &CacheSnapshot) -> bool {
-        ptr::eq(self.current_ptr, Arc::as_ptr(snapshot))
     }
 
     fn exec<T: Clone>(target: &mut Arc<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) -> bool {

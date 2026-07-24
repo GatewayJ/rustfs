@@ -21,6 +21,18 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
+pub(crate) const SITE_REPLICATION_TOMBSTONE_CLAIM: &str = "x-rustfs-internal-site-replication-tombstone";
+
+pub(crate) fn is_service_account_replication_tombstone(identity: &UserIdentity) -> bool {
+    identity
+        .credentials
+        .claims
+        .as_ref()
+        .and_then(|claims| claims.get(SITE_REPLICATION_TOMBSTONE_CLAIM))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 #[async_trait::async_trait]
 pub trait Store: Clone + Send + Sync + 'static {
     fn has_watcher(&self) -> bool;
@@ -31,7 +43,21 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
-
+    async fn load_user_identity_versioned(&self, name: &str, user_type: UserType) -> Result<(UserIdentity, Option<String>)> {
+        self.load_user_identity(name, user_type)
+            .await
+            .map(|identity| (identity, None))
+    }
+    async fn save_user_identity_if_version(
+        &self,
+        name: &str,
+        user_type: UserType,
+        item: UserIdentity,
+        _expected_version: Option<&str>,
+    ) -> Result<bool> {
+        self.save_user_identity(name, user_type, item, None).await?;
+        Ok(true)
+    }
     async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
     async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String>;
