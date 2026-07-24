@@ -7991,8 +7991,15 @@ mod tests {
     use crate::admin::runtime_sources::{current_outbound_tls_generation, set_test_outbound_tls_generation};
     use crate::admin::storage_api::runtime::Endpoint;
     use crate::admin::storage_api::runtime::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::app::runtime_sources::current_app_context;
     use axum::{Router, extract::State, routing::any};
     use http::{HeaderMap, HeaderValue, Uri};
+    use rustfs_iam::store::{
+        Store,
+        object::{IAM_CONFIG_PREFIX, ObjectStore},
+    };
+    use rustfs_iam::sys::POLICYNAME;
+    use rustfs_madmin::SRSvcAccChange;
     use rustfs_policy::policy::action::S3Action;
     use serial_test::serial;
     use std::sync::{
@@ -8021,6 +8028,113 @@ mod tests {
 
         assert!(sts_replication_compatibility_policy(&verified_claims, "readonly").is_none());
         assert_eq!(sts_replication_compatibility_policy(&legacy_claims, "readonly"), Some("readonly"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replicated_oidc_service_account_replaces_claims_and_groups_in_handler() {
+        if rustfs_credentials::get_global_action_cred().is_none() {
+            rustfs_credentials::init_global_action_credentials(
+                Some("TESTROOTACCESSKEY".to_string()),
+                Some("TESTROOTSECRET123".to_string()),
+            )
+            .expect("test root credentials should initialize");
+        }
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(store).await;
+        }
+        let context = current_app_context().expect("test AppContext should be initialized");
+        ObjectStore::new(context.object_store())
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("test IAM format should be initialized");
+        let iam_sys = current_iam_handle().expect("test AppContext should provide IAM");
+        let parent = "openid=replication-handler-parent";
+        let access_key = "OIDCREPLHANDLER001";
+        let old_claims = HashMap::from([
+            ("parent".to_string(), Value::String(parent.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+        iam_sys
+            .new_service_account(
+                parent,
+                Some(vec!["old-group".to_string()]),
+                NewServiceAccountOpts {
+                    access_key: access_key.to_string(),
+                    secret_key: "replicationHandlerOldSecret123".to_string(),
+                    claims: Some(old_claims),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial service account should be created");
+        iam_sys
+            .update_service_account(
+                access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: Some("disabled".to_string()),
+                    allow_site_replicator_account: false,
+                },
+            )
+            .await
+            .expect("initial service account should be disabled");
+
+        let new_claims = HashMap::from([
+            ("parent".to_string(), Value::String(parent.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent.to_string())),
+            (POLICYNAME.to_string(), Value::String("readonly".to_string())),
+        ]);
+        let session_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::handler-bucket/*"]}]}"#;
+        let updated_at = OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        apply_iam_item(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                create: Some(SRSvcAccCreate {
+                    parent: parent.to_string(),
+                    access_key: access_key.to_string(),
+                    secret_key: "replicationHandlerNewSecret123".to_string(),
+                    groups: vec!["new-group".to_string()],
+                    claims: new_claims.clone(),
+                    session_policy: SRSessionPolicy::from_json(session_policy).expect("session policy should parse"),
+                    status: "enabled".to_string(),
+                    name: "replicated account".to_string(),
+                    description: "replaced by replication".to_string(),
+                    expiration: None,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                oidc_service_account_envelope: Some(rustfs_madmin::SRSvcAccReplicationEnvelope {
+                    version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
+                }),
+                ..Default::default()
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("replicated handler event should replace the service account");
+
+        let stored = iam_sys
+            .get_user(access_key)
+            .await
+            .expect("replicated service account should exist");
+        assert_eq!(stored.credentials.secret_key, "replicationHandlerNewSecret123");
+        assert_eq!(stored.credentials.groups, Some(vec!["new-group".to_string()]));
+        assert_eq!(stored.credentials.status, "on");
+        assert_eq!(stored.credentials.name.as_deref(), Some("replicated account"));
+        assert_eq!(stored.credentials.description.as_deref(), Some("replaced by replication"));
+        let stored_claims = stored.credentials.claims.expect("replicated claims should be present");
+        for (claim, value) in new_claims {
+            assert_eq!(stored_claims.get(&claim), Some(&value));
+        }
+        assert_eq!(stored.update_at, Some(updated_at));
     }
 
     #[test]
